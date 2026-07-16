@@ -83,7 +83,7 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
     private val vy = DoubleArray(maxParticles)
     private var activeCount = 0
 
-    private val rng = Random(0x5eed_1234)
+    private var rng = Random(0x5eed_1234)
     private var injectionAccumulatorKg = 0.0
 
     /**
@@ -127,6 +127,14 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
      * valve-flow calculation see a fake near-vacuum downstream and briefly choke in
      * an artificial pressure spike that has nothing to do with the real boiler state.
      */
+    /**
+     * A repaired/restarted engine is meant to behave exactly like a freshly built one -
+     * a real cold restart has no memory of the previous run, and neither should the
+     * random sampling that stands in for real molecular chaos. Re-seeding here (not
+     * just clearing the particle state) is what actually makes that true: an RNG left
+     * running would keep drawing from wherever thousands of prior substeps left it,
+     * a pure bookkeeping artifact with no physical basis for a real restart.
+     */
     fun reset() {
         activeCount = 0
         injectionAccumulatorKg = 0.0
@@ -135,6 +143,7 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
         relativeSpeedMaxEstimateMPerS =
             sqrt(2.0) * sqrt(BOLTZMANN_J_PER_K * PhysicsConstants.AMBIENT_TEMPERATURE_K / WATER_MOLECULE_MASS_KG)
         pendingCollisionCandidates = 0.0
+        rng = Random(0x5eed_1234)
     }
 
     private fun gaussianSample(): Double {

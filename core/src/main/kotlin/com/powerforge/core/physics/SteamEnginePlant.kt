@@ -91,6 +91,13 @@ class SteamEnginePlant(
      */
     private val flywheelLattice = FlywheelLattice()
 
+    /**
+     * The boiler's own water and the flame heating it, as real colliding particles -
+     * see [BoilerThermalSimulation]. Boiler temperature falls out of the water
+     * particles' actual kinetic energy, not a bulk energy-balance formula.
+     */
+    private val boilerThermal = BoilerThermalSimulation()
+
     private var secondsAtZeroLubricationWhileRunning: Double = 0.0
     private var secondsDryFiring: Double = 0.0
 
@@ -187,6 +194,7 @@ class SteamEnginePlant(
         cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
         kineticGas.reset()
         flywheelLattice.reset(flywheel)
+        boilerThermal.reset()
         previousPhase = CylinderPhase.EXHAUST
         secondsAtZeroLubricationWhileRunning = 0.0
         secondsDryFiring = 0.0
@@ -626,10 +634,20 @@ class SteamEnginePlant(
         } else {
             0.0
         }
-        val netHeatW = effectiveHeatInputW - heatExtractedByPistonW - heatLossToEnvironmentW -
-            automaticVentLossW - manualVentLossW - blowdownLossW - coldFeedwaterHeatSinkW
-        val dTemperatureK = netHeatW / (max(0.005, boilerWaterMassKg) * PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K) * dt
-        boilerTemperatureK = max(PhysicsConstants.AMBIENT_TEMPERATURE_K, boilerTemperatureK + dTemperatureK)
+        // Everything that isn't the flame's own real collisions is still real
+        // mass-carried energy leaving the water (evaporation into the piston or a
+        // vent, cold feedwater absorbing heat) plus real conductive/convective loss
+        // to the environment - all genuinely removed from the water particles'
+        // kinetic energy by BoilerThermalSimulation, not folded back into a bulk
+        // temperature formula.
+        val nonFlameHeatLossW = heatExtractedByPistonW + heatLossToEnvironmentW +
+            automaticVentLossW + manualVentLossW + blowdownLossW + coldFeedwaterHeatSinkW
+        boilerTemperatureK = boilerThermal.step(
+            flamePowerW = effectiveHeatInputW,
+            waterMassKg = max(0.005, boilerWaterMassKg),
+            insulationLossW = nonFlameHeatLossW,
+            dt = dt,
+        )
 
         boilerWaterMassKg = (boilerWaterMassKg + (feedwaterMassFlowKgPerS - waterOutflowKgPerS) * dt)
             .coerceIn(0.0, boiler.waterCapacityKg)
@@ -672,8 +690,12 @@ class SteamEnginePlant(
 
     private fun coolDown(dt: Double) {
         val heatLossToEnvironmentW = boiler.insulationLossWPerK * (boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
-        val dTemperatureK = -heatLossToEnvironmentW / (max(0.005, boilerWaterMassKg) * PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K) * dt
-        boilerTemperatureK = max(PhysicsConstants.AMBIENT_TEMPERATURE_K, boilerTemperatureK + dTemperatureK)
+        boilerTemperatureK = boilerThermal.step(
+            flamePowerW = 0.0,
+            waterMassKg = max(0.005, boilerWaterMassKg),
+            insulationLossW = heatLossToEnvironmentW,
+            dt = dt,
+        )
         val windingCoolingW = 0.8 * (rotorWindingTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
         rotorWindingTemperatureK = max(
             PhysicsConstants.AMBIENT_TEMPERATURE_K,

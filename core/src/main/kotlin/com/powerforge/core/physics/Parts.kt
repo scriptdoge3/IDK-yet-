@@ -13,10 +13,14 @@ import kotlin.math.pow
 
 /** Burns fuel to heat the boiler water; also the pressure vessel and water tank itself. */
 data class Boiler(val level: Int) {
-    // Piston swept volume grows roughly cubically with level (bore and stroke both scale
-    // up), so heat generation has to compound too or an upgraded boiler paired with an
-    // upgraded piston would starve the cylinder worse at every level instead of better.
-    val heatInputW: Double = 2400.0 * 1.4.pow(level - 1)
+    // A real, modest flame - about what a small spirit-lamp or single-jet gas burner
+    // under a hobby-scale boiler actually puts out, not an inflated number chosen to
+    // hit a target power output. Piston swept volume grows roughly cubically with
+    // level (bore and stroke both scale up), so heat generation has to compound too
+    // or an upgraded boiler paired with an upgraded piston would starve the cylinder
+    // worse at every level instead of better - representing a bigger burner at
+    // higher levels, the same way the piston itself represents a bigger cylinder.
+    val heatInputW: Double = 100.0 * 1.4.pow(level - 1)
     val waterCapacityKg: Double = 0.03 + (level - 1) * 0.045
     val insulationLossWPerK: Double = max(0.5, 2.6 - (level - 1) * 0.18)
     val maxPressurePa: Double = 300_000.0 + (level - 1) * 45_000.0
@@ -57,12 +61,13 @@ data class PistonAssembly(val level: Int) {
 /**
  * Smooths torque delivery, but adds rotating mass and inertia to the shaft. Cast iron,
  * the traditional real material for flywheels - [PhysicsConstants.CAST_IRON_DENSITY_KG_PER_M3]
- * and [PhysicsConstants.CAST_IRON_TENSILE_STRENGTH_PA] are what actually determine how
- * fast it can spin before it bursts (see [SteamEnginePlant]'s damage check), not a
- * separate per-level number: a bigger rim at the same tip speed carries the same real
- * hoop stress, so the only thing raising the practical burst RPM at higher levels is the
- * player choosing to spin it less, or upgrading the Frame so a smaller flywheel can carry
- * the same rotating mass.
+ * fixes the density at every level, and [tensileStrengthPa] (a real casting-quality grade
+ * that improves with level) plus the rim's real geometry are what actually determine how
+ * fast it can spin before it bursts (see [FlywheelLattice]'s bond-breaking simulation): a
+ * bigger rim at the same tip speed carries the same real hoop stress, so raising the
+ * practical burst RPM at higher levels comes from better casting quality and the player
+ * choosing to spin it less, or upgrading the Frame so a smaller flywheel can carry the
+ * same rotating mass.
  */
 data class Flywheel(val level: Int) {
     val massKg: Double = 2.2 + (level - 1) * 0.42
@@ -70,6 +75,20 @@ data class Flywheel(val level: Int) {
 
     /** Solid disk: I = 1/2 m r^2. */
     val momentOfInertiaKgM2: Double get() = 0.5 * massKg * radiusM * radiusM
+
+    /**
+     * A level-1 flywheel is the player's first, unrefined casting - real porosity and
+     * inclusions derate it well below standard graded iron (see
+     * [PhysicsConstants.FLAWED_CAST_IRON_TENSILE_STRENGTH_PA]). Each level buys better
+     * casting quality control, closing the gap toward clean standard-grade cast iron
+     * ([PhysicsConstants.CAST_IRON_TENSILE_STRENGTH_PA]) - real foundry process
+     * improvement, not a number chosen to hit a target burst RPM.
+     */
+    val tensileStrengthPa: Double = minOf(
+        PhysicsConstants.CAST_IRON_TENSILE_STRENGTH_PA,
+        PhysicsConstants.FLAWED_CAST_IRON_TENSILE_STRENGTH_PA +
+            (level - 1) * PhysicsConstants.CAST_IRON_GRADE_IMPROVEMENT_PA_PER_LEVEL,
+    )
 }
 
 /** DC generator equivalent circuit: EMF = ke*omega, current limited by internal + load resistance. */

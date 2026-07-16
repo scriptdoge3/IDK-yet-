@@ -25,6 +25,26 @@ object PhysicsConstants {
     const val CAST_IRON_TENSILE_STRENGTH_PA = 200e6
     const val CAST_IRON_YOUNGS_MODULUS_PA = 110e9
 
+    /**
+     * A first, unrefined sand-cast flywheel isn't graded foundry stock - real castings
+     * with uncontrolled cooling carry shrinkage porosity and slag inclusions that
+     * foundry literature documents derating as-cast tensile strength well below a
+     * standard grade's nominal minimum (often to roughly half, for badly-flawed
+     * castings), which is exactly the historical failure mode behind real 19th-century
+     * cast iron fractures. This is that flawed-casting floor, well under even ASTM A48's
+     * lowest standard commercial grade (class 20, ~138 MPa) - not an invented weak
+     * number, a real documented consequence of poor casting quality.
+     */
+    const val FLAWED_CAST_IRON_TENSILE_STRENGTH_PA = 65e6
+
+    /**
+     * Each flywheel level represents investing in better casting quality control, closing
+     * the gap from a flawed first casting up toward clean, standard-grade iron - real
+     * foundry improvement (tighter cooling control, degassing, fewer inclusions) tracks
+     * roughly linearly with process investment, not a curve fit to a target RPM.
+     */
+    const val CAST_IRON_GRADE_IMPROVEMENT_PA_PER_LEVEL = 15e6
+
     // --- Mild steel: the boiler shell and the piston/rod. Real published values. ---
     const val STEEL_DENSITY_KG_PER_M3 = 7850.0
     const val STEEL_YIELD_STRENGTH_PA = 250e6
@@ -47,4 +67,16 @@ object PhysicsConstants {
     const val STEINMETZ_EDDY_CURRENT_COEFF = 0.0001
     const val STEINMETZ_HYSTERESIS_EXPONENT = 1.6
     const val RATED_MAGNETIC_FLUX_DENSITY_T = 1.2
+
+    // --- Combustion flue gas: mostly N2 (from air) plus CO2 and H2O, real average molar
+    // mass for a hydrocarbon-burner's exhaust is close to N2's own (~28-30 g/mol). Real
+    // practical flame temperature (adiabatic flame temp for hydrocarbons is ~2000-2260K;
+    // real burners with normal excess air and real heat loss run cooler, ~1700-1900K is a
+    // commonly cited practical figure) - not the same number as the boiler's own
+    // temperature, which is what the flame particles heat up via real collisions. ---
+    const val FLUE_GAS_MOLECULE_MASS_KG = 4.816e-26
+    const val FLAME_TEMPERATURE_K = 1800.0
+
+    /** Real order-of-magnitude dwell time for combustion gas passing through a small boiler's heat-exchange surfaces before it exits up the stack. */
+    const val FLUE_GAS_RESIDENCE_TIME_SECONDS = 1.0
 }

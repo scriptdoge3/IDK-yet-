@@ -78,7 +78,7 @@ class FlywheelLattice(private val pointCount: Int = 24) {
         // Standard axial-rod spring constant, k = E*A/L - the real stiffness a segment
         // of real cast iron with this real cross-section and length actually has.
         springConstantNPerM = PhysicsConstants.CAST_IRON_YOUNGS_MODULUS_PA * crossSectionAreaM2 / naturalSegmentLengthM
-        maxBondTensionN = PhysicsConstants.CAST_IRON_TENSILE_STRENGTH_PA * crossSectionAreaM2
+        maxBondTensionN = flywheel.tensileStrengthPa * crossSectionAreaM2
 
         // Real materials have internal (structural) damping, but nowhere near enough to
         // keep an explicit numerical integrator of a spring this stiff stable at a
