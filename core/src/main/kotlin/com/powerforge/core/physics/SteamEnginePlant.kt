@@ -1,23 +1,33 @@
 package com.powerforge.core.physics
 
 import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.sin
 
 /**
  * A single-cylinder steam engine driving a flywheel and a DC generator rotor,
  * operated through a full real control panel rather than running on autopilot.
  *
- * State is integrated forward each [step]: boiler temperature and water mass,
- * drivetrain angular velocity, rotor winding temperature, and bearing lubrication.
- * Every control folds directly into the same equations - closing the throttle
- * restricts the compressible mass flow through the valve, cutting the cutoff
- * shortens the admission phase of the stroke, disengaging the clutch removes the
- * rotor's inertia and torque interaction from the shaft entirely, and so on.
+ * The cylinder itself is simulated crank-angle by crank-angle rather than averaged
+ * per revolution: [crankAngleRad] and [cylinderPressurePa] are real state, and each
+ * substep runs the actual indicator-diagram phases a real slide-valve engine goes
+ * through - admission (steam flows in through the throttle valve and fills the
+ * cylinder per the ideal gas law), expansion (valve shuts at the cutoff angle and
+ * the trapped steam expands adiabatically, PV^k = const), and exhaust (the cylinder
+ * vents to backpressure). Instantaneous torque comes from the actual cylinder
+ * pressure at the actual crank angle via the connecting-rod-corrected crank-effort
+ * formula, not an averaged mean-effective-pressure shortcut - so effects like
+ * over-expansion (cutting steam off so early the pressure drops below atmospheric
+ * before bottom dead center, dragging the piston) fall out on their own.
  *
- * Mismanaging any one of them has a real, permanent consequence: overspeed bursts
- * the flywheel, sustained overpressure ruptures the boiler, firing it dry cooks it,
+ * Everything else - boiler temperature and water mass, drivetrain angular velocity,
+ * rotor winding temperature, bearing lubrication - is integrated the same way.
+ * Mismanaging any control has a real, permanent consequence: overspeed bursts the
+ * flywheel, sustained overpressure ruptures the boiler, firing it dry cooks it,
  * neglected bearings seize, and overexcited/overloaded windings burn out. Once
  * [isDamaged] is true the plant is dead until [repair] is called.
  */
@@ -39,6 +49,14 @@ class SteamEnginePlant(
     var angularVelocityRadPerS: Double = 0.0
         private set
 
+    /** Where the crank actually is right now; starts slightly off dead center like a real parked engine. */
+    var crankAngleRad: Double = 0.3
+        private set
+
+    /** Real, tracked cylinder pressure - not an average, the value at [crankAngleRad] right now. */
+    var cylinderPressurePa: Double = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
+        private set
+
     var rotorWindingTemperatureK: Double = PhysicsConstants.AMBIENT_TEMPERATURE_K
         private set
 
@@ -51,6 +69,11 @@ class SteamEnginePlant(
     var damageReason: FailureReason = FailureReason.NONE
         private set
 
+    private var cylinderSteamMassKg: Double = 0.0
+    private var cutoffReferencePressurePa: Double = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
+    private var cutoffReferenceVolumeM3: Double = 0.0
+    private var previousPhase: CylinderPhase = CylinderPhase.EXHAUST
+
     private var secondsAtZeroLubricationWhileRunning: Double = 0.0
     private var secondsDryFiring: Double = 0.0
 
@@ -59,7 +82,7 @@ class SteamEnginePlant(
     /** Main steam admission valve: 0 = shut, 1 = wide open. Governs compressible mass flow. */
     var throttleFraction: Double = 1.0
 
-    /** Fraction of the stroke steam is admitted for before cutting off to expand. */
+    /** Fraction of the half-revolution (TDC to BDC) steam is admitted for before cutting off to expand. */
     var cutoffFraction: Double = 0.75
 
     /** Fuel/air valve on the burner: 0 = no fire, 1 = full burn rate. */
@@ -95,6 +118,10 @@ class SteamEnginePlant(
         boilerWaterMassKg = boiler.waterCapacityKg
         boilerTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
         angularVelocityRadPerS = 0.0
+        crankAngleRad = 0.3
+        cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
+        cylinderSteamMassKg = 0.0
+        previousPhase = CylinderPhase.EXHAUST
         secondsAtZeroLubricationWhileRunning = 0.0
         secondsDryFiring = 0.0
     }
@@ -109,9 +136,11 @@ class SteamEnginePlant(
 
     private val lubricationDepletionPercentPerSecond = 0.08
     private val bearingSeizeThresholdSeconds = 90.0
-    private val dryFireGraceSeconds = 3.0
+    private val dryFireGraceSeconds = 0.5
     private val boilerRuptureMargin = 1.5
     private val emergencyBrakeTorqueNm = 40.0
+
+    private enum class CylinderPhase { ADMISSION, EXPANSION, EXHAUST }
 
     fun rotatingAssemblyMassKg(): Double = flywheel.massKg + rotor.massKg + shaftMassKg
 
@@ -130,14 +159,33 @@ class SteamEnginePlant(
         return filmCoeff + (boundaryCoeff - filmCoeff) * exp(-omega / omegaTransition)
     }
 
+    /** Cylinder volume at crank angle [theta] via slider-crank kinematics (0 = TDC). */
+    private fun cylinderVolumeM3(theta: Double): Double {
+        val r = piston.crankRadiusM
+        val l = piston.connectingRodLengthM
+        val displacementM = r * (1.0 - cos(theta)) + (r * r / (4.0 * l)) * (1.0 - cos(2.0 * theta))
+        return piston.clearanceVolumeM3 + piston.pistonAreaM2 * displacementM
+    }
+
     /**
-     * Advances the simulation by [dtSeconds] of in-game time, split into small
-     * substeps for numerical stability (semi-implicit Euler).
+     * Advances the simulation by [dtSeconds] of in-game time. Substep size adapts to
+     * how fast the crank is turning, so the admission/expansion/exhaust phases are
+     * always resolved to roughly 60 slices per revolution regardless of RPM.
      */
     fun step(dtSeconds: Double) {
-        val substeps = max(1, (dtSeconds / 0.01).toInt())
-        val h = dtSeconds / substeps
-        repeat(substeps) { integrateSubstep(h) }
+        val maxSubsteps = 20_000
+        val minSubstepSeconds = if (angularVelocityRadPerS > 0.5) {
+            (2.0 * PI / angularVelocityRadPerS / 60.0).coerceIn(0.00005, 0.01)
+        } else {
+            0.01
+        }
+        val h = max(minSubstepSeconds, dtSeconds / maxSubsteps)
+        var remaining = dtSeconds
+        while (remaining > 1e-9) {
+            val actualH = min(h, remaining)
+            integrateSubstep(actualH)
+            remaining -= actualH
+        }
     }
 
     private fun integrateSubstep(dt: Double) {
@@ -150,46 +198,78 @@ class SteamEnginePlant(
         val rawSaturationPa = saturationPressurePa(boilerTemperatureK)
         val boilerPressurePa = min(rawSaturationPa, boiler.maxPressurePa)
         val hasWater = boilerWaterMassKg > 1e-6
-        val throttle = throttleFraction.coerceIn(0.0, 1.0)
-        val cutoff = cutoffFraction.coerceIn(0.05, 0.98)
+        val throttleAreaM2 = piston.maxValveAreaM2 * throttleFraction.coerceIn(0.0, 1.0)
+        val cutoffAngleRad = cutoffFraction.coerceIn(0.05, 0.98) * PI
 
-        val throttleAreaM2 = piston.maxValveAreaM2 * throttle
-        val maxValveMassFlowKgPerS = if (hasWater) {
-            compressibleMassFlowKgPerS(
-                areaM2 = throttleAreaM2,
-                dischargeCoefficient = 0.85,
-                upstreamPressurePa = boilerPressurePa,
-                upstreamTemperatureK = boilerTemperatureK,
-                downstreamPressurePa = piston.exhaustPressurePa,
-            )
-        } else {
-            0.0
+        // Double-acting: steam is admitted alternately on each face of the piston, so every
+        // half-revolution is its own fresh admission/expansion/exhaust cycle, mirrored from
+        // whichever dead center it just left. localTheta is progress through the current half.
+        val theta = crankAngleRad
+        val localTheta = if (theta < PI) theta else theta - PI
+        val volume = cylinderVolumeM3(localTheta)
+        val phase = when {
+            overloaded || !hasWater -> CylinderPhase.EXHAUST
+            localTheta < cutoffAngleRad -> CylinderPhase.ADMISSION
+            localTheta < PI -> CylinderPhase.EXPANSION
+            else -> CylinderPhase.EXHAUST
+        }
+        if (phase != previousPhase) {
+            when (phase) {
+                CylinderPhase.EXPANSION -> {
+                    cutoffReferencePressurePa = cylinderPressurePa
+                    cutoffReferenceVolumeM3 = volume
+                }
+                CylinderPhase.EXHAUST -> {
+                    cylinderSteamMassKg = 0.0
+                }
+                CylinderPhase.ADMISSION -> {
+                    cylinderSteamMassKg = 0.0
+                }
+            }
+            previousPhase = phase
         }
 
-        var omega = angularVelocityRadPerS
-        val revolutionsPerSecond = omega / (2.0 * PI)
-        val demandedMassFlowKgPerS = steamDensityKgPerM3(boilerPressurePa, boilerTemperatureK) *
-            piston.sweptVolumeM3 * revolutionsPerSecond
-        val supplyRatio = if (demandedMassFlowKgPerS > 1e-9) {
-            (maxValveMassFlowKgPerS / demandedMassFlowKgPerS).coerceIn(0.0, 1.0)
-        } else {
-            1.0
+        var steamMassFlowIntoCylinderKgPerS = 0.0
+        when (phase) {
+            CylinderPhase.ADMISSION -> {
+                val flow = compressibleMassFlowKgPerS(
+                    areaM2 = throttleAreaM2,
+                    dischargeCoefficient = 0.85,
+                    upstreamPressurePa = boilerPressurePa,
+                    upstreamTemperatureK = boilerTemperatureK,
+                    downstreamPressurePa = cylinderPressurePa,
+                )
+                cylinderSteamMassKg += flow * dt
+                cylinderPressurePa = min(
+                    boilerPressurePa,
+                    cylinderSteamMassKg * PhysicsConstants.STEAM_SPECIFIC_GAS_CONSTANT_J_PER_KG_K *
+                        boilerTemperatureK / volume,
+                )
+                steamMassFlowIntoCylinderKgPerS = flow
+            }
+            CylinderPhase.EXPANSION -> {
+                cylinderPressurePa = cutoffReferencePressurePa *
+                    (cutoffReferenceVolumeM3 / volume).pow(STEAM_SPECIFIC_HEAT_RATIO)
+            }
+            CylinderPhase.EXHAUST -> {
+                cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
+            }
         }
-        val admissionPressurePa = boilerPressurePa * supplyRatio
-        val meanEffectivePressurePa = admissionPressurePa * hyperbolicExpansionMeanPressureFactor(cutoff)
 
-        val drivingTorqueNm = if (overloaded || !hasWater) {
-            0.0
-        } else {
-            val netPistonPressurePa = max(0.0, meanEffectivePressurePa - piston.exhaustPressurePa)
-            netPistonPressurePa * piston.pistonAreaM2 * piston.crankRadiusM * PhysicsConstants.MEAN_TORQUE_FACTOR
-        }
+        // Both halves push the crank the same rotational direction (that's the point of
+        // double-acting), so the crank-effort kinematics are evaluated on localTheta, not
+        // the full angle - otherwise the second half would wrongly compute as reverse torque.
+        val netForceN = (cylinderPressurePa - PhysicsConstants.ATMOSPHERIC_PRESSURE_PA) * piston.pistonAreaM2
+        val r = piston.crankRadiusM
+        val l = piston.connectingRodLengthM
+        val drivingTorqueNm = netForceN * (r * sin(localTheta) + (r * r / (2.0 * l)) * sin(2.0 * localTheta))
 
         val muCoulombAtRest = coulombFrictionCoefficient(0.0)
         val normalForceN = rotatingAssemblyMassKg() * PhysicsConstants.GRAVITY_M_PER_S2
         val staticFrictionTorqueNm =
             muCoulombAtRest * normalForceN * frame.bearingRadiusM * PhysicsConstants.STATIC_FRICTION_MULTIPLIER
 
+        var omega = angularVelocityRadPerS
         omega = when {
             overloaded -> 0.0
             omega <= 1e-6 && drivingTorqueNm <= staticFrictionTorqueNm -> 0.0
@@ -215,6 +295,7 @@ class SteamEnginePlant(
             }
         }
         angularVelocityRadPerS = omega
+        crankAngleRad = (crankAngleRad + omega * dt) % (2.0 * PI)
 
         // --- Rotor winding thermal balance ---
         val current = if (clutchEngaged) {
@@ -244,13 +325,7 @@ class SteamEnginePlant(
         }
 
         // --- Boiler mass + energy balance ---
-        val cutoffLimitedDemandKgPerS = demandedMassFlowKgPerS * cutoff
-        val actualSteamMassFlowKgPerS = if (overloaded || !hasWater) {
-            0.0
-        } else {
-            min(cutoffLimitedDemandKgPerS, maxValveMassFlowKgPerS)
-        }
-        val heatExtractedByPistonW = actualSteamMassFlowKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
+        val heatExtractedByPistonW = steamMassFlowIntoCylinderKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
         val heatLossToEnvironmentW = boiler.insulationLossWPerK * (boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
 
         // The automatic relief valve is a real orifice too, sized to a fraction of what the
@@ -268,7 +343,7 @@ class SteamEnginePlant(
         // A real boiler is level-regulated: it never forces in more water than there's room
         // for. Without this cap, an always-open feed valve on an already-full tank would
         // keep cold-shocking the boiler for water that's actually just overflowing away.
-        val waterOutflowKgPerS = actualSteamMassFlowKgPerS + automaticVentMassFlowKgPerS + manualVentMassFlowKgPerS
+        val waterOutflowKgPerS = steamMassFlowIntoCylinderKgPerS + automaticVentMassFlowKgPerS + manualVentMassFlowKgPerS
         val commandedFeedwaterFlowKgPerS = feedwaterValveFraction.coerceIn(0.0, 1.0) * boiler.feedwaterMaxFlowKgPerS
         val headroomKg = max(0.0, boiler.waterCapacityKg - boilerWaterMassKg)
         val maxUsefulFeedwaterFlowKgPerS = headroomKg / dt + waterOutflowKgPerS
@@ -285,7 +360,7 @@ class SteamEnginePlant(
         boilerWaterMassKg = (boilerWaterMassKg + (feedwaterMassFlowKgPerS - waterOutflowKgPerS) * dt)
             .coerceIn(0.0, boiler.waterCapacityKg)
 
-        val lowWaterThresholdKg = 0.08 * boiler.waterCapacityKg
+        val lowWaterThresholdKg = 0.15 * boiler.waterCapacityKg
         secondsDryFiring = if (boilerWaterMassKg <= lowWaterThresholdKg && ignitionOn && fuelValveFraction > 0.0) {
             secondsDryFiring + dt
         } else {
@@ -349,6 +424,8 @@ class SteamEnginePlant(
             boilerTemperatureK = boilerTemperatureK,
             boilerPressurePa = min(saturationPressurePa(boilerTemperatureK), boiler.maxPressurePa),
             boilerWaterLevelFraction = (boilerWaterMassKg / boiler.waterCapacityKg).coerceIn(0.0, 1.0),
+            cylinderPressurePa = cylinderPressurePa,
+            crankAngleRad = crankAngleRad,
             angularVelocityRadPerS = angularVelocityRadPerS,
             rpm = angularVelocityRadPerS * 60.0 / (2.0 * PI),
             electricalPowerW = electricalW,

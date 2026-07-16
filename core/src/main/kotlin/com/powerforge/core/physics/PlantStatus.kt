@@ -33,6 +33,8 @@ data class PlantStatus(
     val boilerTemperatureK: Double,
     val boilerPressurePa: Double,
     val boilerWaterLevelFraction: Double,
+    val cylinderPressurePa: Double,
+    val crankAngleRad: Double,
     val angularVelocityRadPerS: Double,
     val rpm: Double,
     val electricalPowerW: Double,

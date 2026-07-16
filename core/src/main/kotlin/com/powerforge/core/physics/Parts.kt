@@ -12,7 +12,7 @@ import kotlin.math.max
 
 /** Burns fuel to heat the boiler water; also the pressure vessel and water tank itself. */
 data class Boiler(val level: Int) {
-    val heatInputW: Double = 1030.0 + (level - 1) * 320.0
+    val heatInputW: Double = 2400.0 + (level - 1) * 320.0
     val waterCapacityKg: Double = 0.03 + (level - 1) * 0.045
     val insulationLossWPerK: Double = max(0.5, 2.6 - (level - 1) * 0.18)
     val maxPressurePa: Double = 300_000.0 + (level - 1) * 45_000.0
@@ -25,20 +25,25 @@ data class Boiler(val level: Int) {
 data class PistonAssembly(val level: Int) {
     val boreRadiusM: Double = 0.011 + (level - 1) * 0.0018
     val crankRadiusM: Double = 0.017 + (level - 1) * 0.0024
-    val exhaustPressurePa: Double = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
 
     val pistonAreaM2: Double get() = PI * boreRadiusM * boreRadiusM
     val strokeLengthM: Double get() = 2.0 * crankRadiusM
     val sweptVolumeM3: Double get() = pistonAreaM2 * strokeLengthM
 
     /** Throttle/cutoff valve throat scales with cylinder size - a bigger engine needs a bigger valve. */
-    val maxValveAreaM2: Double get() = pistonAreaM2 * 0.004
+    val maxValveAreaM2: Double get() = pistonAreaM2 * 0.05
+
+    /** Real cylinders never fully empty at TDC - a small dead volume stays trapped. */
+    val clearanceVolumeM3: Double get() = sweptVolumeM3 * 0.08
+
+    /** Connecting rod length; a 4:1 rod/crank ratio is typical of real reciprocating engines. */
+    val connectingRodLengthM: Double get() = crankRadiusM * 4.0
 }
 
 /** Smooths torque delivery, but adds rotating mass and inertia to the shaft. */
 data class Flywheel(val level: Int) {
-    val massKg: Double = 0.35 + (level - 1) * 0.42
-    val radiusM: Double = 0.045 + (level - 1) * 0.014
+    val massKg: Double = 2.2 + (level - 1) * 0.42
+    val radiusM: Double = 0.095 + (level - 1) * 0.014
 
     /** Solid disk: I = 1/2 m r^2. */
     val momentOfInertiaKgM2: Double get() = 0.5 * massKg * radiusM * radiusM
@@ -67,7 +72,7 @@ data class GeneratorRotor(val level: Int) {
  * and the assembly is physically too heavy for the mounts to carry, full stop.
  */
 data class Frame(val level: Int) {
-    val maxSupportedRotatingMassKg: Double = 1.0 + (level - 1) * 0.7
+    val maxSupportedRotatingMassKg: Double = 3.0 + (level - 1) * 0.7
     val bearingFrictionCoeff: Double = max(0.012, 0.045 - (level - 1) * 0.004)
     val viscousFrictionCoeffNmSPerRad: Double = max(0.00015, 0.00065 - (level - 1) * 0.00005)
     val bearingRadiusM: Double = 0.008

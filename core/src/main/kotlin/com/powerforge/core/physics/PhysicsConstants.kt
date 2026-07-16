@@ -10,9 +10,6 @@ object PhysicsConstants {
     const val REFERENCE_BOILING_POINT_K = 373.15
     const val AMBIENT_TEMPERATURE_K = 293.15
 
-    /** Mean torque of a single-acting piston over one revolution is (2/pi) times its peak. */
-    const val MEAN_TORQUE_FACTOR = 2.0 / Math.PI
-
     /** Static friction always exceeds kinetic friction for real bearings. */
     const val STATIC_FRICTION_MULTIPLIER = 1.6
 }

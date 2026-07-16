@@ -38,14 +38,3 @@ fun compressibleMassFlowKgPerS(
             sqrt(max(0.0, (2.0 * k / (k - 1.0)) * upstreamPressurePa * upstreamDensity * term))
     }
 }
-
-/**
- * Mean effective pressure factor for a cutoff-governed cycle expanding hyperbolically
- * (PV = const) after admission stops at [cutoffRatio] (fraction of the stroke).
- * This is the standard textbook indicator-diagram formula for governed steam engines:
- * running a shorter cutoff trades peak torque for using the same steam more efficiently.
- */
-fun hyperbolicExpansionMeanPressureFactor(cutoffRatio: Double): Double {
-    val r = cutoffRatio.coerceIn(0.05, 0.98)
-    return r + r * kotlin.math.ln(1.0 / r)
-}
