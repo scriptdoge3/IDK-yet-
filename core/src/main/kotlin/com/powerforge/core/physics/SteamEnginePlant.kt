@@ -5,7 +5,6 @@ import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
 import kotlin.math.sin
 
 /**
@@ -74,9 +73,14 @@ class SteamEnginePlant(
     var damageReason: FailureReason = FailureReason.NONE
         private set
 
-    private var cylinderSteamMassKg: Double = 0.0
-    private var cutoffReferencePressurePa: Double = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
-    private var cutoffReferenceVolumeM3: Double = 0.0
+    /**
+     * The actual cylinder charge, molecule by (representative) molecule. Pressure and
+     * temperature are never assumed algebraically here - they fall out of genuinely
+     * simulated Maxwell-Boltzmann-sampled particles elastically colliding with the
+     * bore wall and the moving piston face. See [KineticCylinderGas] for the full
+     * explanation of what is and isn't simplified.
+     */
+    private val kineticGas = KineticCylinderGas()
     private var previousPhase: CylinderPhase = CylinderPhase.EXHAUST
 
     private var secondsAtZeroLubricationWhileRunning: Double = 0.0
@@ -173,7 +177,7 @@ class SteamEnginePlant(
         angularVelocityRadPerS = 0.0
         crankAngleRad = 0.3
         cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
-        cylinderSteamMassKg = 0.0
+        kineticGas.reset()
         previousPhase = CylinderPhase.EXHAUST
         secondsAtZeroLubricationWhileRunning = 0.0
         secondsDryFiring = 0.0
@@ -217,6 +221,9 @@ class SteamEnginePlant(
         const val BREAKER_LATENCY_SECONDS = 0.15
         const val DRAIN_COCKS_LATENCY_SECONDS = 0.3
         const val BLOWDOWN_LATENCY_SECONDS = 0.3
+
+        /** Representative steam temperature used only to size the kinetic gas's particle scaling. */
+        const val NOMINAL_STEAM_TEMPERATURE_K = 420.0
     }
 
     fun rotatingAssemblyMassKg(): Double = flywheel.massKg + rotor.massKg + shaftMassKg
@@ -259,8 +266,13 @@ class SteamEnginePlant(
      */
     fun step(dtSeconds: Double) {
         val maxSubsteps = 20_000
+        // Floored well above the crank-angle-only floor this used before the kinetic gas
+        // existed: resolving each slice now costs a real per-particle collision pass, not
+        // an O(1) formula, so an unbounded floor at extreme (pre-burst overspeed) RPM would
+        // multiply substep count and per-substep cost together. 60 slices/rev is still held
+        // at any RPM below ~5000 - well past where every flywheel level bursts anyway.
         val minSubstepSeconds = if (angularVelocityRadPerS > 0.5) {
-            (2.0 * PI / angularVelocityRadPerS / 60.0).coerceIn(0.00005, 0.01)
+            (2.0 * PI / angularVelocityRadPerS / 60.0).coerceIn(0.0004, 0.01)
         } else {
             0.01
         }
@@ -313,6 +325,13 @@ class SteamEnginePlant(
         val theta = crankAngleRad
         val localTheta = if (theta < PI) theta else theta - PI
         val volume = cylinderVolumeM3(localTheta)
+        val r = piston.crankRadiusM
+        val l = piston.connectingRodLengthM
+        // The same bracket term that corrects crank-effort torque for the connecting rod
+        // is, by the virtual work principle, exactly dx/dtheta - so multiplying it by the
+        // angular velocity already carried into this substep gives the piston's actual
+        // linear velocity, which the gas needs to resolve elastic collisions off a moving wall.
+        val pistonVelocityMPerS = angularVelocityRadPerS * (r * sin(localTheta) + (r * r / (2.0 * l)) * sin(2.0 * localTheta))
         val phase = when {
             overloaded || !hasWater -> CylinderPhase.EXHAUST
             localTheta < cutoffAngleRad -> CylinderPhase.ADMISSION
@@ -321,41 +340,47 @@ class SteamEnginePlant(
         }
         if (phase != previousPhase) {
             when (phase) {
-                CylinderPhase.EXPANSION -> {
-                    cutoffReferencePressurePa = cylinderPressurePa
-                    cutoffReferenceVolumeM3 = volume
-                }
-                CylinderPhase.EXHAUST -> {
-                    cylinderSteamMassKg = 0.0
-                }
-                CylinderPhase.ADMISSION -> {
-                    cylinderSteamMassKg = 0.0
-                }
+                CylinderPhase.ADMISSION, CylinderPhase.EXHAUST -> kineticGas.reset()
+                CylinderPhase.EXPANSION -> { /* carry the trapped charge straight into expansion */ }
             }
             previousPhase = phase
         }
 
         var steamMassFlowIntoCylinderKgPerS = 0.0
         when (phase) {
-            CylinderPhase.ADMISSION -> {
-                val flow = compressibleMassFlowKgPerS(
-                    areaM2 = throttleAreaM2,
-                    dischargeCoefficient = 0.85,
-                    upstreamPressurePa = boilerPressurePa,
-                    upstreamTemperatureK = boilerTemperatureK,
-                    downstreamPressurePa = cylinderPressurePa,
+            CylinderPhase.ADMISSION, CylinderPhase.EXPANSION -> {
+                val flow = if (phase == CylinderPhase.ADMISSION) {
+                    compressibleMassFlowKgPerS(
+                        areaM2 = throttleAreaM2,
+                        dischargeCoefficient = 0.85,
+                        upstreamPressurePa = boilerPressurePa,
+                        upstreamTemperatureK = boilerTemperatureK,
+                        downstreamPressurePa = kineticGas.lastPressurePa,
+                    )
+                } else {
+                    0.0 // valve is shut past cutoff - the trapped charge just keeps expanding
+                }
+                // Sized off the boiler's rated max pressure, not its live (still-warming-up)
+                // pressure - a live estimate would lock the particle scaling factor in
+                // small during a cold start's low-density transient, and once the particle
+                // budget filled up on that stale small charge it could never widen again
+                // even after the boiler reached full pressure.
+                val fullChamberMassEstimateKg = (piston.clearanceVolumeM3 + piston.sweptVolumeM3) *
+                    steamDensityKgPerM3(boiler.maxPressurePa, NOMINAL_STEAM_TEMPERATURE_K)
+                cylinderPressurePa = kineticGas.substep(
+                    massFlowInKgPerS = flow,
+                    sourceTemperatureK = boilerTemperatureK,
+                    fullChamberMassEstimateKg = fullChamberMassEstimateKg,
+                    pistonPositionM = volume / piston.pistonAreaM2,
+                    pistonVelocityMPerS = pistonVelocityMPerS,
+                    halfWidthM = piston.boreRadiusM,
+                    pistonAreaM2 = piston.pistonAreaM2,
+                    dt = dt,
                 )
-                cylinderSteamMassKg += flow * dt
-                cylinderPressurePa = min(
-                    boilerPressurePa,
-                    cylinderSteamMassKg * PhysicsConstants.STEAM_SPECIFIC_GAS_CONSTANT_J_PER_KG_K *
-                        boilerTemperatureK / volume,
-                )
-                steamMassFlowIntoCylinderKgPerS = flow
-            }
-            CylinderPhase.EXPANSION -> {
-                cylinderPressurePa = cutoffReferencePressurePa *
-                    (cutoffReferenceVolumeM3 / volume).pow(STEAM_SPECIFIC_HEAT_RATIO)
+                // Charge the boiler for what the chamber actually had room to represent,
+                // not the theoretical valve throughput - once the particle budget is full
+                // the two can diverge, and the energy balance has to follow the real one.
+                steamMassFlowIntoCylinderKgPerS = kineticGas.lastActualMassFlowKgPerS
             }
             CylinderPhase.EXHAUST -> {
                 cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
@@ -371,8 +396,6 @@ class SteamEnginePlant(
         // double-acting), so the crank-effort kinematics are evaluated on localTheta, not
         // the full angle - otherwise the second half would wrongly compute as reverse torque.
         val netForceN = (cylinderPressurePa - PhysicsConstants.ATMOSPHERIC_PRESSURE_PA) * piston.pistonAreaM2 * drainCocksLossFactor
-        val r = piston.crankRadiusM
-        val l = piston.connectingRodLengthM
         val drivingTorqueNm = netForceN * (r * sin(localTheta) + (r * r / (2.0 * l)) * sin(2.0 * localTheta))
 
         val muCoulombAtRest = coulombFrictionCoefficient(0.0)
@@ -419,7 +442,7 @@ class SteamEnginePlant(
         }
         val resistiveHeatingW = current * current * rotor.internalResistanceOhm
         val overExcitation = max(0.0, effectiveExcitationFraction - 1.0)
-        val fieldWindingHeatingW = if (currentFlows) (3.0 + rotor.level * 0.5) * overExcitation * overExcitation * 220.0 else 0.0
+        val fieldWindingHeatingW = if (currentFlows) (3.0 + rotor.level * 0.5) * overExcitation * overExcitation * 260.0 else 0.0
         val windingCoolingW = (0.8 + 0.01 * omega) * (rotorWindingTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
         val netWindingHeatW = resistiveHeatingW + fieldWindingHeatingW - windingCoolingW
         rotorWindingTemperatureK = max(
