@@ -1,7 +1,6 @@
 package com.powerforge.app.ui
 
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -40,13 +39,13 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Mo
         Column(modifier = Modifier.fillMaxSize()) {
             HeaderBar(state)
 
-            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                FlywheelVisual(
-                    rpmProvider = { latestState.value.rpm },
-                    isFailing = state.isFailing,
-                    modifier = Modifier.padding(vertical = 16.dp),
-                )
-            }
+            EngineMechanismVisual(
+                rpmProvider = { latestState.value.rpm },
+                crankAngleRadProvider = { latestState.value.crankAngleRad },
+                cylinderPressurePaProvider = { latestState.value.cylinderPressurePa },
+                isFailing = state.isFailing,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+            )
 
             if (state.isDamaged) {
                 DamageBanner(state, onRepair = viewModel::repair)
@@ -54,7 +53,8 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Mo
                 WarningBanner(state)
             }
 
-            StatsPanel(state)
+            GaugeCluster(state)
+            SecondaryReadouts(state)
 
             LazyColumn(
                 modifier = Modifier.fillMaxWidth().weight(1f),
@@ -165,17 +165,48 @@ private fun WarningBanner(state: PlantUiState) {
 }
 
 @Composable
-private fun StatsPanel(state: PlantUiState) {
+private fun GaugeCluster(state: PlantUiState) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+    ) {
+        GaugeDial(
+            label = "Pressure",
+            value = (state.boilerPressurePa / 1000.0).toFloat(),
+            minValue = 0f,
+            maxValue = 900f,
+            unit = " kPa",
+            dangerValue = 600f,
+        )
+        GaugeDial(
+            label = "RPM",
+            value = state.rpm.toFloat(),
+            minValue = 0f,
+            maxValue = 3000f,
+            unit = "",
+            dangerValue = 2500f,
+        )
+        GaugeDial(
+            label = "Boiler",
+            value = (state.boilerTemperatureK - 273.15).toFloat(),
+            minValue = 0f,
+            maxValue = 300f,
+            unit = "°C",
+            dangerValue = 220f,
+        )
+        SightGlass(waterLevelFraction = state.boilerWaterLevelFraction.toFloat())
+    }
+}
+
+@Composable
+private fun SecondaryReadouts(state: PlantUiState) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         StatItem("Output", "${"%.1f".format(state.electricalPowerW)} W")
-        StatItem("RPM", "${state.rpm.roundToInt()}")
-        StatItem("Boiler", "${(state.boilerTemperatureK - 273.15).roundToInt()}°C")
-        StatItem("Pressure", "${(state.boilerPressurePa / 1000).roundToInt()} kPa")
-        StatItem("Water", "${(state.boilerWaterLevelFraction * 100).roundToInt()}%")
         StatItem("Efficiency", "${"%.1f".format(state.overallEfficiency * 100)}%")
+        StatItem("Winding", "${(state.rotorWindingTemperatureK - 273.15).roundToInt()}°C")
     }
 }
 

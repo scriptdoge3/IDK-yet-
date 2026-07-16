@@ -190,6 +190,8 @@ class PlantViewModel : ViewModel() {
             boilerTemperatureK = status.boilerTemperatureK,
             boilerPressurePa = status.boilerPressurePa,
             boilerWaterLevelFraction = status.boilerWaterLevelFraction,
+            cylinderPressurePa = status.cylinderPressurePa,
+            crankAngleRad = status.crankAngleRad,
             rpm = status.rpm,
             electricalPowerW = status.electricalPowerW,
             heatInputW = status.heatInputW,

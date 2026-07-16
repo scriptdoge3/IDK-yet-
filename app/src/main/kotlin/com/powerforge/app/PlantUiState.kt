@@ -42,6 +42,8 @@ data class PlantUiState(
     val boilerTemperatureK: Double = 0.0,
     val boilerPressurePa: Double = 0.0,
     val boilerWaterLevelFraction: Double = 1.0,
+    val cylinderPressurePa: Double = 101_325.0,
+    val crankAngleRad: Double = 0.0,
     val rpm: Double = 0.0,
     val electricalPowerW: Double = 0.0,
     val heatInputW: Double = 0.0,
