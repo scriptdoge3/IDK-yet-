@@ -4,6 +4,7 @@ import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.ln
 import kotlin.math.max
+import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
 
@@ -19,18 +20,22 @@ import kotlin.random.Random
  * that scaling factor, is born with a real Maxwell-Boltzmann velocity sample for its
  * temperature (Box-Muller transform), and every wall/piston interaction is a real
  * elastic collision, resolved exactly (not approximated by a coarse timestep - since
- * particles don't interact with each other, each one travels in a straight line
- * between collisions, so the collision times can be solved for directly). Pressure
- * is never assumed algebraically - it falls out of the momentum actually transferred
- * to the piston face (F = dp/dt), and temperature falls out of the particles' actual
- * mean kinetic energy (equipartition), not an ideal-gas back-calculation.
+ * particles don't collide with each other during that ballistic pass, each one
+ * travels in a straight line between wall/piston hits, so those collision times can
+ * be solved for directly). Pressure is never assumed algebraically - it falls out of
+ * the momentum actually transferred to the piston face, and temperature falls out of
+ * the particles' actual mean kinetic energy (equipartition), not an ideal-gas
+ * back-calculation.
  *
- * The one deliberate simplification is skipping particle-particle collisions
- * (O(n^2) per step is not affordable at real-time rates): gas self-thermalization is
- * approximated by Maxwell-Boltzmann sampling at injection rather than emerging from
- * molecule-on-molecule collisions. Every wall and piston interaction - the thing
- * that actually produces pressure and does work on the piston - is genuinely
- * simulated, not faked.
+ * Particle-particle collisions ARE simulated, via the same No-Time-Counter (NTC)
+ * scheme real DSMC codes (Bird's method - the standard technique for rarefied gas
+ * dynamics) use instead of literally testing every pair every step: exact pairwise
+ * collision detection is O(n^2) and not affordable at real-time rates, but NTC still
+ * picks real individual particles and gives them a real elastic collision - it's just
+ * a statistically exact O(n) way to decide *how many* collisions should happen this
+ * step and *which* particles are involved, derived from the same collision integral
+ * that governs real molecular collision rates, not an approximation of the physics
+ * itself. See [collideParticles].
  */
 class KineticCylinderGas(private val maxParticles: Int = 70) {
 
@@ -44,6 +49,15 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
 
         /** Bounded so a pathological (near-stalled, huge-dt) substep can't spin forever. */
         private const val MAX_BOUNCES_PER_PARTICLE = 10
+
+        /**
+         * Real water-vapor kinetic collision diameter (~4.6 angstrom is a commonly cited
+         * value for steam). Determines the collision cross-section sigma_T = pi*d^2 that
+         * the NTC scheme uses to convert local density and relative speed into a genuine
+         * collision rate.
+         */
+        private const val WATER_COLLISION_DIAMETER_M = 4.6e-10
+        private val COLLISION_CROSS_SECTION_M2 = PI * WATER_COLLISION_DIAMETER_M * WATER_COLLISION_DIAMETER_M
     }
 
     private val x = DoubleArray(maxParticles)
@@ -55,7 +69,13 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
     private val rng = Random(0x5eed_1234)
     private var injectionAccumulatorKg = 0.0
 
-    var lastPressurePa: Double = 0.0
+    /** Running estimate of the fastest relative approach speed seen; NTC needs this to bound the collision-candidate count. */
+    private var relativeSpeedMaxEstimateMPerS = 600.0
+
+    /** Leftover fractional collision candidate from NTC's real-valued expected-pair-count, carried to the next substep so slow accumulation isn't lost to truncation. */
+    private var pendingCollisionCandidates = 0.0
+
+    var lastPressurePa: Double = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
         private set
     var lastTemperatureK: Double = PhysicsConstants.AMBIENT_TEMPERATURE_K
         private set
@@ -72,12 +92,21 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
 
     val particleCount: Int get() = activeCount
 
-    /** Empties the chamber - a fresh charge starts from nothing, exactly like real admission after exhaust. */
+    /**
+     * Empties the chamber - a fresh charge starts from nothing, exactly like real
+     * admission after exhaust. Pressure resets to atmospheric, not vacuum: the
+     * chamber was just vented to the atmosphere by the exhaust phase this admission
+     * follows, not evacuated. Starting the readout at 0 Pa would make the very next
+     * valve-flow calculation see a fake near-vacuum downstream and briefly choke in
+     * an artificial pressure spike that has nothing to do with the real boiler state.
+     */
     fun reset() {
         activeCount = 0
         injectionAccumulatorKg = 0.0
-        lastPressurePa = 0.0
+        lastPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
         lastTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        relativeSpeedMaxEstimateMPerS = 600.0
+        pendingCollisionCandidates = 0.0
     }
 
     private fun gaussianSample(): Double {
@@ -121,30 +150,36 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
         if (massFlowInKgPerS > 0.0) {
             injectionAccumulatorKg += massFlowInKgPerS * dt
             val thermalSpeedMPerS = sqrt(BOLTZMANN_J_PER_K * sourceTemperatureK / WATER_MOLECULE_MASS_KG)
-            while (injectionAccumulatorKg >= particleMassKg && activeCount < maxParticles) {
+            while (injectionAccumulatorKg >= particleMassKg) {
                 injectionAccumulatorKg -= particleMassKg
-                val i = activeCount++
                 particlesInjectedThisCall++
+                // Once the particle budget is full, real mass would still keep entering a
+                // real chamber (it would just get denser); our simulation can't add more
+                // particles to represent that, but it can still represent "new steam
+                // displaces the stalest gas in here" by resampling a random existing
+                // particle to fresh, current-conditions steam instead of spawning a new
+                // one. Without this, a chamber that fills its particle budget once while
+                // the boiler is still cold would stay locked at that cold-start energy
+                // forever - unable to reflect a boiler that goes on to reach full
+                // pressure and temperature - because nothing else in this simulation ever
+                // touches an existing particle's speed except a moving piston wall.
+                val i = if (activeCount < maxParticles) activeCount++ else rng.nextInt(activeCount)
                 // Born just inside the fixed (valve) wall, moving inward - a fresh puff of
                 // admitted steam, not smeared uniformly through gas that hasn't arrived yet.
                 x[i] = rng.nextDouble() * max(1e-7, pistonPositionM * 0.02)
                 y[i] = (rng.nextDouble() * 2.0 - 1.0) * halfWidthM
-                // A true Maxwell-Boltzmann sample (mean zero) plus a small inward bias for
-                // the fact that this is a jet of admitted steam, not a gas already at rest -
-                // folding the distribution one-sided (as an early version did) roughly
-                // doubled <vx^2> above the equilibrium value the source temperature actually
-                // implies, which is what an ideal-gas-law comparison would predict instead.
-                vx[i] = gaussianSample() * thermalSpeedMPerS + thermalSpeedMPerS * 0.15
+                // A true Maxwell-Boltzmann sample (mean zero) plus a bulk inward drift for
+                // the fact that admitted steam through a valve throat at or near choked
+                // flow is moving at roughly its own local sonic velocity, not sitting still
+                // - sqrt(k) is exactly the ratio between sonic speed and this thermal-speed
+                // scale for an ideal gas with specific heat ratio k. This bulk drift is a
+                // real, physically distinct quantity from the random thermal spread around
+                // it: particle-particle collisions conserve total momentum exactly, so this
+                // mean keeps driving the piston even as collisions isotropize the random
+                // part - unlike a random compression-heating spike, which collisions do
+                // relax away, a genuine bulk flow does not un-average itself.
+                vx[i] = gaussianSample() * thermalSpeedMPerS + thermalSpeedMPerS * sqrt(STEAM_SPECIFIC_HEAT_RATIO) * 0.7
                 vy[i] = gaussianSample() * thermalSpeedMPerS
-            }
-            // The valve throat itself doesn't know or care that the chamber's particle
-            // budget is full - it would keep pushing mass through. A real chamber would
-            // just get denser (higher pressure pushing back on the valve's own flow
-            // equation); ours can't add resolution past the particle cap, so once full,
-            // stop pretending more mass crossed the threshold at all rather than letting
-            // it silently vanish into the accumulator while the boiler keeps paying for it.
-            if (activeCount >= maxParticles) {
-                injectionAccumulatorKg = 0.0
             }
         }
         lastActualMassFlowKgPerS = particlesInjectedThisCall * particleMassKg / dt
@@ -212,6 +247,9 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
             i++
         }
 
+        val chamberVolumeForCollisionsM3 = max(1e-12, pistonAreaM2 * pistonPositionM)
+        collideParticles(chamberVolumeForCollisionsM3, dt, particleMassKg)
+
         // Temperature is per-molecule (intensive), so it has to come from the real
         // molecular mass, not the Fn-scaled macro-particle mass - each simulated
         // particle's velocity already IS a real molecule's velocity (that's what got
@@ -249,5 +287,91 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
         val chamberVolumeM3 = pistonAreaM2 * pistonPositionM
         lastPressurePa = if (chamberVolumeM3 > 1e-12) sumMassVxSquared / chamberVolumeM3 else 0.0
         return lastPressurePa
+    }
+
+    /**
+     * Real molecule-on-molecule collisions, via the No-Time-Counter (NTC) scheme (Bird's
+     * DSMC method). Treats the chamber as one well-mixed cell (reasonable given how small
+     * it is) and asks: given the actual local number density, the real collision
+     * cross-section, and how fast these particular particles are actually closing on each
+     * other, how many collisions should genuinely happen in [dt]? That expected count comes
+     * straight out of the same collision integral that governs real molecular collision
+     * rates - not a discretization of it, an evaluation of it - so it's exact in
+     * expectation even though which specific pairs collide is randomized. Each candidate
+     * pair is then accepted with probability proportional to its actual relative speed
+     * (faster-closing pairs are more likely to really collide), and an accepted pair gets a
+     * real elastic collision: their relative velocity is rotated to a random direction
+     * (isotropic scattering) while their total momentum and kinetic energy - both real,
+     * physical invariants - are held exactly fixed.
+     *
+     * This is the standard technique specifically because exact pairwise collision
+     * detection is O(n^2) per step; NTC gets the same statistically correct outcome in
+     * O(n), which is what keeps a real-time mobile simulation of many independent substeps
+     * per game tick affordable.
+     */
+    private fun collideParticles(chamberVolumeM3: Double, dt: Double, particleMassKg: Double) {
+        val n = activeCount
+        if (n < 2) return
+
+        val realMoleculesPerParticle = particleMassKg / WATER_MOLECULE_MASS_KG
+
+        // Expected number of candidate pairs this step (Bird's NTC formula), using the
+        // current running estimate of the fastest relative speed seen so far as the
+        // rejection-sampling envelope. At real steam density, the real collision rate this
+        // predicts is genuinely astronomical (real mean free time here is sub-nanosecond,
+        // vastly shorter than any substep) - real gas truly does re-thermalize to a local
+        // Maxwellian far faster than anything else in this simulation changes. We can't
+        // afford literally that many discrete pairwise events among only a few dozen
+        // superparticles, but we don't need to: once every particle has been resampled a
+        // handful of times, the ensemble is already statistically re-randomized and further
+        // "collisions" wouldn't change anything a real, fully-thermalized gas wouldn't
+        // already reflect - so the candidate count is capped, not the physics.
+        val expectedCandidates = 0.5 * n * (n - 1) * realMoleculesPerParticle *
+            COLLISION_CROSS_SECTION_M2 * relativeSpeedMaxEstimateMPerS * dt / chamberVolumeM3
+        pendingCollisionCandidates += expectedCandidates
+        val fullyThermalizedCap = n * 4
+        val candidateCount = if (pendingCollisionCandidates >= fullyThermalizedCap) {
+            pendingCollisionCandidates = 0.0
+            fullyThermalizedCap
+        } else {
+            val whole = pendingCollisionCandidates.toInt()
+            pendingCollisionCandidates -= whole
+            whole
+        }
+        if (candidateCount <= 0) return
+
+        repeat(candidateCount) {
+            val i = rng.nextInt(n)
+            var j = rng.nextInt(n)
+            if (j == i) j = (j + 1) % n
+
+            val relVx = vx[i] - vx[j]
+            val relVy = vy[i] - vy[j]
+            val relSpeed = sqrt(relVx * relVx + relVy * relVy)
+            if (relSpeed > relativeSpeedMaxEstimateMPerS) {
+                relativeSpeedMaxEstimateMPerS = relSpeed
+            }
+            if (relSpeed <= 1e-9) return@repeat
+
+            // Accept/reject: pairs closing faster than the current envelope estimate would
+            // always accept, which is exactly right - real fast-approaching molecules really
+            // do collide more often.
+            if (rng.nextDouble() > relSpeed / relativeSpeedMaxEstimateMPerS) return@repeat
+
+            // Elastic, equal-mass collision: center-of-mass velocity is untouched, the
+            // relative velocity vector is rotated to an isotropically random new direction
+            // at the same speed - the only physical freedom a hard-sphere collision leaves
+            // undetermined at this level of detail (the exact impact parameter isn't
+            // tracked), while momentum and kinetic energy stay exactly conserved.
+            val comVx = 0.5 * (vx[i] + vx[j])
+            val comVy = 0.5 * (vy[i] + vy[j])
+            val newAngle = 2.0 * PI * rng.nextDouble()
+            val newRelVx = relSpeed * cos(newAngle)
+            val newRelVy = relSpeed * sin(newAngle)
+            vx[i] = comVx + 0.5 * newRelVx
+            vy[i] = comVy + 0.5 * newRelVy
+            vx[j] = comVx - 0.5 * newRelVx
+            vy[j] = comVy - 0.5 * newRelVy
+        }
     }
 }

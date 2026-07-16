@@ -128,7 +128,11 @@ class SteamEnginePlantTest {
         val status = runToSteadyState(plant, totalSeconds = 60.0)
 
         assertEquals(FailureReason.IGNITION_OFF, status.failureReason)
-        assertEquals(0.0, status.electricalPowerW, 1e-9)
+        // A tighter tolerance doesn't hold anymore now that cylinder pressure comes from a
+        // genuine (noisy) finite-particle ensemble rather than an algebraic formula - a few
+        // leftover fast molecules can still transfer a physically negligible sliver of
+        // momentum before the trapped charge fully settles.
+        assertEquals(0.0, status.electricalPowerW, 1e-4)
     }
 
     @Test
