@@ -67,13 +67,18 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Mo
                         onThrottleChange = viewModel::setThrottle,
                         onCutoffChange = viewModel::setCutoff,
                         onFuelValveChange = viewModel::setFuelValve,
+                        onAirDamperChange = viewModel::setAirDamper,
                         onIgnitionChange = viewModel::setIgnition,
                         onFeedwaterValveChange = viewModel::setFeedwaterValve,
                         onSafetyValveChange = viewModel::setSafetyValveOpen,
                         onExcitationChange = viewModel::setExcitation,
+                        onLoadRheostatChange = viewModel::setLoadRheostat,
+                        onLubricatorFeedRateChange = viewModel::setLubricatorFeedRate,
                         onClutchChange = viewModel::setClutchEngaged,
                         onEmergencyBrakeChange = viewModel::setEmergencyBrake,
-                        onAddOil = viewModel::addOil,
+                        onCircuitBreakerChange = viewModel::setCircuitBreakerClosed,
+                        onDrainCocksChange = viewModel::setDrainCocksOpen,
+                        onBlowdownValveChange = viewModel::setBlowdownValveOpen,
                     )
                 }
                 item {

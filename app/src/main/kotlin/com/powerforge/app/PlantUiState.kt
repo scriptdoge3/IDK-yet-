@@ -27,13 +27,20 @@ data class ControlsUiState(
     val throttleFraction: Double = 1.0,
     val cutoffFraction: Double = 0.75,
     val fuelValveFraction: Double = 1.0,
+    val airDamperFraction: Double = 0.65,
     val ignitionOn: Boolean = true,
     val feedwaterValveFraction: Double = 1.0,
     val safetyValveOpen: Boolean = false,
     val excitationFraction: Double = 1.0,
+    val loadRheostatOhm: Double = 2.0,
+    val lubricatorFeedRateFraction: Double = 0.7,
     val clutchEngaged: Boolean = true,
     val emergencyBrakeEngaged: Boolean = false,
+    val circuitBreakerClosed: Boolean = true,
+    val drainCocksOpen: Boolean = false,
+    val blowdownValveOpen: Boolean = false,
     val lubricationPercent: Double = 100.0,
+    val boilerScalePercent: Double = 0.0,
 )
 
 data class PlantUiState(

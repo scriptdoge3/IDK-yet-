@@ -31,7 +31,6 @@ class PlantViewModel : ViewModel() {
         private const val CREDITS_PER_JOULE = 1.0
         private const val BASE_RESEARCH_POINTS_PER_SECOND = 0.3
         private const val RESEARCH_POINTS_PER_WATT_SECOND = 0.01
-        private const val OIL_COST_CREDITS = 25L
         private const val BASE_REPAIR_COST_CREDITS = 150L
         private const val REPAIR_COST_PER_LEVEL_CREDITS = 35L
     }
@@ -83,13 +82,6 @@ class PlantViewModel : ViewModel() {
         _uiState.update { buildUiState() }
     }
 
-    fun addOil() {
-        if (credits < OIL_COST_CREDITS) return
-        credits -= OIL_COST_CREDITS
-        plant.addLubrication()
-        _uiState.update { buildUiState() }
-    }
-
     fun setThrottle(fraction: Double) {
         plant.throttleFraction = fraction.coerceIn(0.0, 1.0)
         pushControls()
@@ -135,6 +127,36 @@ class PlantViewModel : ViewModel() {
         pushControls()
     }
 
+    fun setAirDamper(fraction: Double) {
+        plant.airDamperFraction = fraction.coerceIn(0.0, 1.0)
+        pushControls()
+    }
+
+    fun setLoadRheostat(ohm: Double) {
+        plant.loadRheostatOhm = ohm.coerceIn(0.5, 6.0)
+        pushControls()
+    }
+
+    fun setLubricatorFeedRate(fraction: Double) {
+        plant.lubricatorFeedRateFraction = fraction.coerceIn(0.0, 1.0)
+        pushControls()
+    }
+
+    fun setCircuitBreakerClosed(closed: Boolean) {
+        plant.circuitBreakerClosed = closed
+        pushControls()
+    }
+
+    fun setDrainCocksOpen(open: Boolean) {
+        plant.drainCocksOpen = open
+        pushControls()
+    }
+
+    fun setBlowdownValveOpen(open: Boolean) {
+        plant.blowdownValveOpen = open
+        pushControls()
+    }
+
     private fun pushControls() {
         _uiState.update {
             it.copy(
@@ -142,12 +164,18 @@ class PlantViewModel : ViewModel() {
                     throttleFraction = plant.throttleFraction,
                     cutoffFraction = plant.cutoffFraction,
                     fuelValveFraction = plant.fuelValveFraction,
+                    airDamperFraction = plant.airDamperFraction,
                     ignitionOn = plant.ignitionOn,
                     feedwaterValveFraction = plant.feedwaterValveFraction,
                     safetyValveOpen = plant.safetyValveOpen,
                     excitationFraction = plant.excitationFraction,
+                    loadRheostatOhm = plant.loadRheostatOhm,
+                    lubricatorFeedRateFraction = plant.lubricatorFeedRateFraction,
                     clutchEngaged = plant.clutchEngaged,
                     emergencyBrakeEngaged = plant.emergencyBrakeEngaged,
+                    circuitBreakerClosed = plant.circuitBreakerClosed,
+                    drainCocksOpen = plant.drainCocksOpen,
+                    blowdownValveOpen = plant.blowdownValveOpen,
                 ),
             )
         }
@@ -208,13 +236,20 @@ class PlantViewModel : ViewModel() {
                 throttleFraction = plant.throttleFraction,
                 cutoffFraction = plant.cutoffFraction,
                 fuelValveFraction = plant.fuelValveFraction,
+                airDamperFraction = plant.airDamperFraction,
                 ignitionOn = plant.ignitionOn,
                 feedwaterValveFraction = plant.feedwaterValveFraction,
                 safetyValveOpen = plant.safetyValveOpen,
                 excitationFraction = plant.excitationFraction,
+                loadRheostatOhm = plant.loadRheostatOhm,
+                lubricatorFeedRateFraction = plant.lubricatorFeedRateFraction,
                 clutchEngaged = plant.clutchEngaged,
                 emergencyBrakeEngaged = plant.emergencyBrakeEngaged,
+                circuitBreakerClosed = plant.circuitBreakerClosed,
+                drainCocksOpen = plant.drainCocksOpen,
+                blowdownValveOpen = plant.blowdownValveOpen,
                 lubricationPercent = status.lubricationPercent,
+                boilerScalePercent = status.boilerScalePercent,
             ),
         )
     }

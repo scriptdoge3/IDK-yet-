@@ -33,6 +33,7 @@ data class PlantStatus(
     val boilerTemperatureK: Double,
     val boilerPressurePa: Double,
     val boilerWaterLevelFraction: Double,
+    val boilerScalePercent: Double,
     val cylinderPressurePa: Double,
     val crankAngleRad: Double,
     val angularVelocityRadPerS: Double,
@@ -45,6 +46,9 @@ data class PlantStatus(
     val lubricationPercent: Double,
     val rotorWindingTemperatureK: Double,
     val generatorEngaged: Boolean,
+    val circuitBreakerClosed: Boolean,
+    val drainCocksOpen: Boolean,
+    val blowdownValveOpen: Boolean,
     val isDamaged: Boolean,
     val failureReason: FailureReason,
 ) {

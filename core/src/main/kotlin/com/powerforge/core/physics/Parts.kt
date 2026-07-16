@@ -2,6 +2,7 @@ package com.powerforge.core.physics
 
 import kotlin.math.PI
 import kotlin.math.max
+import kotlin.math.pow
 
 /**
  * All part properties are derived from an integer [level] so the UI, the save
@@ -12,7 +13,10 @@ import kotlin.math.max
 
 /** Burns fuel to heat the boiler water; also the pressure vessel and water tank itself. */
 data class Boiler(val level: Int) {
-    val heatInputW: Double = 2400.0 + (level - 1) * 320.0
+    // Piston swept volume grows roughly cubically with level (bore and stroke both scale
+    // up), so heat generation has to compound too or an upgraded boiler paired with an
+    // upgraded piston would starve the cylinder worse at every level instead of better.
+    val heatInputW: Double = 2400.0 * 1.4.pow(level - 1)
     val waterCapacityKg: Double = 0.03 + (level - 1) * 0.045
     val insulationLossWPerK: Double = max(0.5, 2.6 - (level - 1) * 0.18)
     val maxPressurePa: Double = 300_000.0 + (level - 1) * 45_000.0

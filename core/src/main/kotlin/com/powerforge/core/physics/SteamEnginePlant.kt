@@ -15,17 +15,18 @@ import kotlin.math.sin
  * The cylinder itself is simulated crank-angle by crank-angle rather than averaged
  * per revolution: [crankAngleRad] and [cylinderPressurePa] are real state, and each
  * substep runs the actual indicator-diagram phases a real slide-valve engine goes
- * through - admission (steam flows in through the throttle valve and fills the
- * cylinder per the ideal gas law), expansion (valve shuts at the cutoff angle and
- * the trapped steam expands adiabatically, PV^k = const), and exhaust (the cylinder
- * vents to backpressure). Instantaneous torque comes from the actual cylinder
- * pressure at the actual crank angle via the connecting-rod-corrected crank-effort
- * formula, not an averaged mean-effective-pressure shortcut - so effects like
- * over-expansion (cutting steam off so early the pressure drops below atmospheric
- * before bottom dead center, dragging the piston) fall out on their own.
+ * through - admission, expansion (PV^k = const past the cutoff angle), exhaust.
+ * Instantaneous torque comes from the actual cylinder pressure at the actual crank
+ * angle via the connecting-rod-corrected crank-effort formula.
  *
- * Everything else - boiler temperature and water mass, drivetrain angular velocity,
- * rotor winding temperature, bearing lubrication - is integrated the same way.
+ * Every control has a real actuator behind it, not an instant value change: the
+ * continuous valves (throttle, cutoff, fuel, feedwater, air damper, the lubricator,
+ * the load rheostat) slew at a bounded rate like a hand-turned wheel, field
+ * excitation follows a first-order electrical lag like a winding's inductance
+ * resisting a sudden current change, and every switch/lever has real throw latency.
+ * [step] advances the commanded->effective actuator state the same way it advances
+ * everything else.
+ *
  * Mismanaging any control has a real, permanent consequence: overspeed bursts the
  * flywheel, sustained overpressure ruptures the boiler, firing it dry cooks it,
  * neglected bearings seize, and overexcited/overloaded windings burn out. Once
@@ -44,6 +45,10 @@ class SteamEnginePlant(
         private set
 
     var boilerWaterMassKg: Double = boiler.waterCapacityKg
+        private set
+
+    /** Mineral scale from untreated water, deposited on the heat-exchange surface while firing. */
+    var boilerScalePercent: Double = 0.0
         private set
 
     var angularVelocityRadPerS: Double = 0.0
@@ -77,7 +82,7 @@ class SteamEnginePlant(
     private var secondsAtZeroLubricationWhileRunning: Double = 0.0
     private var secondsDryFiring: Double = 0.0
 
-    // --- Operator controls: the full panel, always present ---
+    // --- Operator controls: commanded values (what the player sets) ---
 
     /** Main steam admission valve: 0 = shut, 1 = wide open. Governs compressible mass flow. */
     var throttleFraction: Double = 1.0
@@ -88,27 +93,74 @@ class SteamEnginePlant(
     /** Fuel/air valve on the burner: 0 = no fire, 1 = full burn rate. */
     var fuelValveFraction: Double = 1.0
 
-    /** Master ignition. When off, no heat is produced regardless of the fuel valve. */
-    var ignitionOn: Boolean = true
+    /** Draft/air damper. Combustion is most efficient near the optimum; too little or too much air both hurt it. */
+    var airDamperFraction: Double = 0.65
 
     /** How hard the feedwater pump is pushing fresh water into the boiler. */
     var feedwaterValveFraction: Double = 1.0
 
-    /** Manually bleeds boiler pressure, independent of the automatic safety relief. */
-    var safetyValveOpen: Boolean = false
-
     /** Generator field strength. 1.0 = rated. Above 1.0 trades winding life for more output. */
     var excitationFraction: Double = 1.0
 
+    /** External load resistance the generator is feeding. Lower draws more current (and more torque, and more heat). */
+    var loadRheostatOhm: Double = 2.0
+
+    /** Force-feed lubricator drip rate. Needs to roughly keep pace with wear or the bearings dry out. */
+    var lubricatorFeedRateFraction: Double = 0.7
+
+    private val ignitionSwitch = LatchedSwitch(true, IGNITION_LATENCY_SECONDS)
+    private val safetyValveSwitch = LatchedSwitch(false, RELIEF_VALVE_LATENCY_SECONDS)
+    private val clutchSwitch = LatchedSwitch(true, CLUTCH_LATENCY_SECONDS)
+    private val emergencyBrakeSwitch = LatchedSwitch(false, BRAKE_LATENCY_SECONDS)
+    private val circuitBreakerSwitch = LatchedSwitch(true, BREAKER_LATENCY_SECONDS)
+    private val drainCocksSwitch = LatchedSwitch(false, DRAIN_COCKS_LATENCY_SECONDS)
+    private val blowdownValveSwitch = LatchedSwitch(false, BLOWDOWN_LATENCY_SECONDS)
+
+    /** Master ignition. When off, no heat is produced regardless of the fuel valve. */
+    var ignitionOn: Boolean
+        get() = ignitionSwitch.commanded
+        set(value) { ignitionSwitch.commanded = value }
+
+    /** Manually bleeds boiler pressure, independent of the automatic safety relief. */
+    var safetyValveOpen: Boolean
+        get() = safetyValveSwitch.commanded
+        set(value) { safetyValveSwitch.commanded = value }
+
     /** True mechanical clutch: disengaged, the rotor's mass/inertia leaves the shaft entirely. */
-    var clutchEngaged: Boolean = true
+    var clutchEngaged: Boolean
+        get() = clutchSwitch.commanded
+        set(value) { clutchSwitch.commanded = value }
 
     /** Emergency stop: dumps a large friction torque onto the shaft. */
-    var emergencyBrakeEngaged: Boolean = false
+    var emergencyBrakeEngaged: Boolean
+        get() = emergencyBrakeSwitch.commanded
+        set(value) { emergencyBrakeSwitch.commanded = value }
 
-    fun addLubrication(amount: Double = 100.0) {
-        lubricationPercent = (lubricationPercent + amount).coerceIn(0.0, 100.0)
-    }
+    /** Electrical disconnect, separate from the clutch: the rotor keeps spinning, current just stops flowing. */
+    var circuitBreakerClosed: Boolean
+        get() = circuitBreakerSwitch.commanded
+        set(value) { circuitBreakerSwitch.commanded = value }
+
+    /** Cylinder drain cocks. Real practice: open for a cold start to clear condensate, close once warmed up. */
+    var drainCocksOpen: Boolean
+        get() = drainCocksSwitch.commanded
+        set(value) { drainCocksSwitch.commanded = value }
+
+    /** Blows down boiler water to purge mineral scale, at the cost of water and heat while open. */
+    var blowdownValveOpen: Boolean
+        get() = blowdownValveSwitch.commanded
+        set(value) { blowdownValveSwitch.commanded = value }
+
+    // --- Effective values: what the physics actually sees, lagging the commanded ones ---
+
+    private var effectiveThrottleFraction = throttleFraction
+    private var effectiveCutoffFraction = cutoffFraction
+    private var effectiveFuelValveFraction = fuelValveFraction
+    private var effectiveAirDamperFraction = airDamperFraction
+    private var effectiveFeedwaterValveFraction = feedwaterValveFraction
+    private var effectiveExcitationFraction = excitationFraction
+    private var effectiveLoadResistanceOhm = loadRheostatOhm
+    private var effectiveLubricatorFeedRateFraction = lubricatorFeedRateFraction
 
     fun repair() {
         isDamaged = false
@@ -116,6 +168,7 @@ class SteamEnginePlant(
         lubricationPercent = 100.0
         rotorWindingTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
         boilerWaterMassKg = boiler.waterCapacityKg
+        boilerScalePercent = 0.0
         boilerTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
         angularVelocityRadPerS = 0.0
         crankAngleRad = 0.3
@@ -124,6 +177,14 @@ class SteamEnginePlant(
         previousPhase = CylinderPhase.EXHAUST
         secondsAtZeroLubricationWhileRunning = 0.0
         secondsDryFiring = 0.0
+        effectiveThrottleFraction = throttleFraction
+        effectiveCutoffFraction = cutoffFraction
+        effectiveFuelValveFraction = fuelValveFraction
+        effectiveAirDamperFraction = airDamperFraction
+        effectiveFeedwaterValveFraction = feedwaterValveFraction
+        effectiveExcitationFraction = excitationFraction
+        effectiveLoadResistanceOhm = loadRheostatOhm
+        effectiveLubricatorFeedRateFraction = lubricatorFeedRateFraction
     }
 
     /** Fixed shaft stub every generation always has, independent of upgrades. */
@@ -131,16 +192,32 @@ class SteamEnginePlant(
     private val shaftRadiusM = 0.010
     private val shaftMomentOfInertiaKgM2 = 0.5 * shaftMassKg * shaftRadiusM * shaftRadiusM
 
-    /** Resistance of whatever the plant is feeding power into (battery bank / local grid). */
-    private val loadResistanceOhm = 2.0
-
     private val lubricationDepletionPercentPerSecond = 0.08
+    private val lubricatorMaxFeedPercentPerSecond = 0.12
+    private val scaleBuildupPercentPerSecond = 0.01
+    private val blowdownDescalePercentPerSecond = 3.0
     private val bearingSeizeThresholdSeconds = 90.0
     private val dryFireGraceSeconds = 0.5
     private val boilerRuptureMargin = 1.5
     private val emergencyBrakeTorqueNm = 40.0
 
     private enum class CylinderPhase { ADMISSION, EXPANSION, EXHAUST }
+
+    private companion object {
+        const val VALVE_SLEW_PER_SECOND = 0.5
+        const val CUTOFF_SLEW_PER_SECOND = 0.3
+        const val LUBRICATOR_SLEW_PER_SECOND = 0.5
+        const val LOAD_RHEOSTAT_SLEW_OHM_PER_SECOND = 2.0
+        const val EXCITATION_TIME_CONSTANT_SECONDS = 0.4
+
+        const val IGNITION_LATENCY_SECONDS = 0.6
+        const val RELIEF_VALVE_LATENCY_SECONDS = 0.3
+        const val CLUTCH_LATENCY_SECONDS = 0.4
+        const val BRAKE_LATENCY_SECONDS = 0.15
+        const val BREAKER_LATENCY_SECONDS = 0.15
+        const val DRAIN_COCKS_LATENCY_SECONDS = 0.3
+        const val BLOWDOWN_LATENCY_SECONDS = 0.3
+    }
 
     fun rotatingAssemblyMassKg(): Double = flywheel.massKg + rotor.massKg + shaftMassKg
 
@@ -149,7 +226,7 @@ class SteamEnginePlant(
 
     private fun totalMomentOfInertiaKgM2(): Double =
         flywheel.momentOfInertiaKgM2 + shaftMomentOfInertiaKgM2 +
-            if (clutchEngaged) rotor.momentOfInertiaKgM2 else 0.0
+            if (clutchSwitch.effective) rotor.momentOfInertiaKgM2 else 0.0
 
     private fun coulombFrictionCoefficient(omega: Double): Double {
         val lubeQuality = (lubricationPercent / 100.0).coerceIn(0.05, 1.0)
@@ -157,6 +234,14 @@ class SteamEnginePlant(
         val filmCoeff = frame.bearingFrictionCoeff * (0.35 + 0.55 * (1.0 - lubeQuality))
         val omegaTransition = max(1.0, 25.0 * lubeQuality)
         return filmCoeff + (boundaryCoeff - filmCoeff) * exp(-omega / omegaTransition)
+    }
+
+    /** Combustion is most efficient near a well-tuned air:fuel ratio; too little or too much air both waste heat. */
+    private fun combustionEfficiencyFactor(airDamper: Double): Double {
+        val optimal = 0.65
+        val spread = 0.35
+        val deviation = (airDamper - optimal) / spread
+        return (1.0 - 0.4 * deviation * deviation).coerceIn(0.3, 1.0)
     }
 
     /** Cylinder volume at crank angle [theta] via slider-crank kinematics (0 = TDC). */
@@ -188,18 +273,39 @@ class SteamEnginePlant(
         }
     }
 
+    private fun updateActuators(dt: Double) {
+        effectiveThrottleFraction = approachLinear(effectiveThrottleFraction, throttleFraction.coerceIn(0.0, 1.0), VALVE_SLEW_PER_SECOND, dt)
+        effectiveCutoffFraction = approachLinear(effectiveCutoffFraction, cutoffFraction.coerceIn(0.05, 0.98), CUTOFF_SLEW_PER_SECOND, dt)
+        effectiveFuelValveFraction = approachLinear(effectiveFuelValveFraction, fuelValveFraction.coerceIn(0.0, 1.0), VALVE_SLEW_PER_SECOND, dt)
+        effectiveAirDamperFraction = approachLinear(effectiveAirDamperFraction, airDamperFraction.coerceIn(0.0, 1.0), VALVE_SLEW_PER_SECOND, dt)
+        effectiveFeedwaterValveFraction = approachLinear(effectiveFeedwaterValveFraction, feedwaterValveFraction.coerceIn(0.0, 1.0), VALVE_SLEW_PER_SECOND, dt)
+        effectiveLubricatorFeedRateFraction = approachLinear(effectiveLubricatorFeedRateFraction, lubricatorFeedRateFraction.coerceIn(0.0, 1.0), LUBRICATOR_SLEW_PER_SECOND, dt)
+        effectiveLoadResistanceOhm = approachLinear(effectiveLoadResistanceOhm, loadRheostatOhm.coerceIn(0.5, 6.0), LOAD_RHEOSTAT_SLEW_OHM_PER_SECOND, dt)
+        effectiveExcitationFraction = approachExponential(effectiveExcitationFraction, excitationFraction.coerceIn(0.0, 1.5), EXCITATION_TIME_CONSTANT_SECONDS, dt)
+
+        ignitionSwitch.update(dt)
+        safetyValveSwitch.update(dt)
+        clutchSwitch.update(dt)
+        emergencyBrakeSwitch.update(dt)
+        circuitBreakerSwitch.update(dt)
+        drainCocksSwitch.update(dt)
+        blowdownValveSwitch.update(dt)
+    }
+
     private fun integrateSubstep(dt: Double) {
         if (isDamaged) {
             coolDown(dt)
             return
         }
 
+        updateActuators(dt)
+
         val overloaded = isStructurallyOverloaded()
         val rawSaturationPa = saturationPressurePa(boilerTemperatureK)
         val boilerPressurePa = min(rawSaturationPa, boiler.maxPressurePa)
         val hasWater = boilerWaterMassKg > 1e-6
-        val throttleAreaM2 = piston.maxValveAreaM2 * throttleFraction.coerceIn(0.0, 1.0)
-        val cutoffAngleRad = cutoffFraction.coerceIn(0.05, 0.98) * PI
+        val throttleAreaM2 = piston.maxValveAreaM2 * effectiveThrottleFraction
+        val cutoffAngleRad = effectiveCutoffFraction * PI
 
         // Double-acting: steam is admitted alternately on each face of the piston, so every
         // half-revolution is its own fresh admission/expansion/exhaust cycle, mirrored from
@@ -256,10 +362,15 @@ class SteamEnginePlant(
             }
         }
 
+        // Open drain cocks bleed most of the working pressure straight to atmosphere instead of
+        // doing work - correct procedure for a cold start (clears condensate) but a real loss
+        // if left open once the engine is actually running.
+        val drainCocksLossFactor = if (drainCocksSwitch.effective) 0.45 else 1.0
+
         // Both halves push the crank the same rotational direction (that's the point of
         // double-acting), so the crank-effort kinematics are evaluated on localTheta, not
         // the full angle - otherwise the second half would wrongly compute as reverse torque.
-        val netForceN = (cylinderPressurePa - PhysicsConstants.ATMOSPHERIC_PRESSURE_PA) * piston.pistonAreaM2
+        val netForceN = (cylinderPressurePa - PhysicsConstants.ATMOSPHERIC_PRESSURE_PA) * piston.pistonAreaM2 * drainCocksLossFactor
         val r = piston.crankRadiusM
         val l = piston.connectingRodLengthM
         val drivingTorqueNm = netForceN * (r * sin(localTheta) + (r * r / (2.0 * l)) * sin(2.0 * localTheta))
@@ -268,6 +379,8 @@ class SteamEnginePlant(
         val normalForceN = rotatingAssemblyMassKg() * PhysicsConstants.GRAVITY_M_PER_S2
         val staticFrictionTorqueNm =
             muCoulombAtRest * normalForceN * frame.bearingRadiusM * PhysicsConstants.STATIC_FRICTION_MULTIPLIER
+
+        val currentFlows = clutchSwitch.effective && circuitBreakerSwitch.effective
 
         var omega = angularVelocityRadPerS
         omega = when {
@@ -279,11 +392,11 @@ class SteamEnginePlant(
                 val lubeQuality = (lubricationPercent / 100.0).coerceIn(0.05, 1.0)
                 val viscousFrictionTorqueNm =
                     frame.viscousFrictionCoeffNmSPerRad * (2.0 - lubeQuality) * omega
-                val brakeTorqueNm = if (emergencyBrakeEngaged) emergencyBrakeTorqueNm else 0.0
+                val brakeTorqueNm = if (emergencyBrakeSwitch.effective) emergencyBrakeTorqueNm else 0.0
 
-                val generatorLoadTorqueNm = if (clutchEngaged) {
-                    val ke = rotor.backEmfConstantVSPerRad * excitationFraction.coerceIn(0.0, 1.5)
-                    ke * ke * omega / (rotor.internalResistanceOhm + loadResistanceOhm)
+                val generatorLoadTorqueNm = if (currentFlows) {
+                    val ke = rotor.backEmfConstantVSPerRad * effectiveExcitationFraction
+                    ke * ke * omega / (rotor.internalResistanceOhm + effectiveLoadResistanceOhm)
                 } else {
                     0.0
                 }
@@ -298,15 +411,15 @@ class SteamEnginePlant(
         crankAngleRad = (crankAngleRad + omega * dt) % (2.0 * PI)
 
         // --- Rotor winding thermal balance ---
-        val current = if (clutchEngaged) {
-            val ke = rotor.backEmfConstantVSPerRad * excitationFraction.coerceIn(0.0, 1.5)
-            ke * omega / (rotor.internalResistanceOhm + loadResistanceOhm)
+        val current = if (currentFlows) {
+            val ke = rotor.backEmfConstantVSPerRad * effectiveExcitationFraction
+            ke * omega / (rotor.internalResistanceOhm + effectiveLoadResistanceOhm)
         } else {
             0.0
         }
         val resistiveHeatingW = current * current * rotor.internalResistanceOhm
-        val overExcitation = max(0.0, excitationFraction - 1.0)
-        val fieldWindingHeatingW = if (clutchEngaged) (3.0 + rotor.level * 0.5) * overExcitation * overExcitation * 220.0 else 0.0
+        val overExcitation = max(0.0, effectiveExcitationFraction - 1.0)
+        val fieldWindingHeatingW = if (currentFlows) (3.0 + rotor.level * 0.5) * overExcitation * overExcitation * 220.0 else 0.0
         val windingCoolingW = (0.8 + 0.01 * omega) * (rotorWindingTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
         val netWindingHeatW = resistiveHeatingW + fieldWindingHeatingW - windingCoolingW
         rotorWindingTemperatureK = max(
@@ -314,15 +427,26 @@ class SteamEnginePlant(
             rotorWindingTemperatureK + netWindingHeatW / rotor.thermalMassJPerK * dt,
         )
 
-        // --- Lubrication wear ---
+        // --- Lubrication: continuous force-feed drip versus continuous wear ---
         if (omega > 1.0) {
             lubricationPercent = (lubricationPercent - lubricationDepletionPercentPerSecond * dt).coerceIn(0.0, 100.0)
         }
+        lubricationPercent = (lubricationPercent + effectiveLubricatorFeedRateFraction * lubricatorMaxFeedPercentPerSecond * dt)
+            .coerceIn(0.0, 100.0)
         secondsAtZeroLubricationWhileRunning = if (lubricationPercent <= 0.5 && omega > 1.0) {
             secondsAtZeroLubricationWhileRunning + dt
         } else {
             0.0
         }
+
+        // --- Boiler scale: builds up while firing, purged by blowing down ---
+        if (ignitionSwitch.effective) {
+            boilerScalePercent = (boilerScalePercent + scaleBuildupPercentPerSecond * dt).coerceIn(0.0, 100.0)
+        }
+        if (blowdownValveSwitch.effective) {
+            boilerScalePercent = (boilerScalePercent - blowdownDescalePercentPerSecond * dt).coerceIn(0.0, 100.0)
+        }
+        val scaleEfficiencyMultiplier = 1.0 - (boilerScalePercent / 100.0) * 0.5
 
         // --- Boiler mass + energy balance ---
         val heatExtractedByPistonW = steamMassFlowIntoCylinderKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
@@ -337,23 +461,34 @@ class SteamEnginePlant(
         val isVenting = rawSaturationPa > boiler.maxPressurePa
         val automaticVentMassFlowKgPerS = if (isVenting) 0.55 * maxBoilerGenerationKgPerS else 0.0
         val automaticVentLossW = automaticVentMassFlowKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
-        val manualVentMassFlowKgPerS = if (safetyValveOpen) 0.7 * maxBoilerGenerationKgPerS else 0.0
+        val manualVentMassFlowKgPerS = if (safetyValveSwitch.effective) 0.7 * maxBoilerGenerationKgPerS else 0.0
         val manualVentLossW = manualVentMassFlowKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
+        val blowdownMassFlowKgPerS = if (blowdownValveSwitch.effective) 0.3 * maxBoilerGenerationKgPerS else 0.0
+        val blowdownLossW = blowdownMassFlowKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
 
         // A real boiler is level-regulated: it never forces in more water than there's room
         // for. Without this cap, an always-open feed valve on an already-full tank would
         // keep cold-shocking the boiler for water that's actually just overflowing away.
-        val waterOutflowKgPerS = steamMassFlowIntoCylinderKgPerS + automaticVentMassFlowKgPerS + manualVentMassFlowKgPerS
-        val commandedFeedwaterFlowKgPerS = feedwaterValveFraction.coerceIn(0.0, 1.0) * boiler.feedwaterMaxFlowKgPerS
+        // (Open drain cocks don't add a separate mass loss here: that steam already left the
+        // boiler as part of steamMassFlowIntoCylinderKgPerS, it just failed to do useful work -
+        // already captured by drainCocksLossFactor knocking down the torque above.)
+        val waterOutflowKgPerS = steamMassFlowIntoCylinderKgPerS + automaticVentMassFlowKgPerS +
+            manualVentMassFlowKgPerS + blowdownMassFlowKgPerS
+        val commandedFeedwaterFlowKgPerS = effectiveFeedwaterValveFraction * boiler.feedwaterMaxFlowKgPerS
         val headroomKg = max(0.0, boiler.waterCapacityKg - boilerWaterMassKg)
         val maxUsefulFeedwaterFlowKgPerS = headroomKg / dt + waterOutflowKgPerS
         val feedwaterMassFlowKgPerS = min(commandedFeedwaterFlowKgPerS, maxUsefulFeedwaterFlowKgPerS)
         val coldFeedwaterHeatSinkW = feedwaterMassFlowKgPerS *
             PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K * max(0.0, boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
 
-        val effectiveHeatInputW = if (ignitionOn) boiler.heatInputW * fuelValveFraction.coerceIn(0.0, 1.0) else 0.0
+        val effectiveHeatInputW = if (ignitionSwitch.effective) {
+            boiler.heatInputW * effectiveFuelValveFraction * combustionEfficiencyFactor(effectiveAirDamperFraction) *
+                scaleEfficiencyMultiplier
+        } else {
+            0.0
+        }
         val netHeatW = effectiveHeatInputW - heatExtractedByPistonW - heatLossToEnvironmentW -
-            automaticVentLossW - manualVentLossW - coldFeedwaterHeatSinkW
+            automaticVentLossW - manualVentLossW - blowdownLossW - coldFeedwaterHeatSinkW
         val dTemperatureK = netHeatW / (max(0.005, boilerWaterMassKg) * PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K) * dt
         boilerTemperatureK = max(PhysicsConstants.AMBIENT_TEMPERATURE_K, boilerTemperatureK + dTemperatureK)
 
@@ -361,7 +496,7 @@ class SteamEnginePlant(
             .coerceIn(0.0, boiler.waterCapacityKg)
 
         val lowWaterThresholdKg = 0.15 * boiler.waterCapacityKg
-        secondsDryFiring = if (boilerWaterMassKg <= lowWaterThresholdKg && ignitionOn && fuelValveFraction > 0.0) {
+        secondsDryFiring = if (boilerWaterMassKg <= lowWaterThresholdKg && ignitionSwitch.effective && effectiveFuelValveFraction > 0.0) {
             secondsDryFiring + dt
         } else {
             0.0
@@ -404,26 +539,32 @@ class SteamEnginePlant(
     }
 
     fun electricalPowerW(): Double {
-        if (!clutchEngaged) return 0.0
-        val ke = rotor.backEmfConstantVSPerRad * excitationFraction.coerceIn(0.0, 1.5)
-        val current = ke * angularVelocityRadPerS / (rotor.internalResistanceOhm + loadResistanceOhm)
-        return current * current * loadResistanceOhm
+        if (!(clutchSwitch.effective && circuitBreakerSwitch.effective)) return 0.0
+        val ke = rotor.backEmfConstantVSPerRad * effectiveExcitationFraction
+        val current = ke * angularVelocityRadPerS / (rotor.internalResistanceOhm + effectiveLoadResistanceOhm)
+        return current * current * effectiveLoadResistanceOhm
     }
 
     fun status(): PlantStatus {
         val failureReason = when {
             isDamaged -> damageReason
             isStructurallyOverloaded() -> FailureReason.STRUCTURAL_OVERLOAD
-            !ignitionOn -> FailureReason.IGNITION_OFF
+            !ignitionSwitch.effective -> FailureReason.IGNITION_OFF
             angularVelocityRadPerS <= 1e-6 -> FailureReason.STALLED_INSUFFICIENT_TORQUE
             else -> FailureReason.NONE
         }
         val electricalW = electricalPowerW()
-        val effectiveHeatInputW = if (ignitionOn) boiler.heatInputW * fuelValveFraction.coerceIn(0.0, 1.0) else 0.0
+        val effectiveHeatInputW = if (ignitionSwitch.effective) {
+            boiler.heatInputW * effectiveFuelValveFraction * combustionEfficiencyFactor(effectiveAirDamperFraction) *
+                (1.0 - (boilerScalePercent / 100.0) * 0.5)
+        } else {
+            0.0
+        }
         return PlantStatus(
             boilerTemperatureK = boilerTemperatureK,
             boilerPressurePa = min(saturationPressurePa(boilerTemperatureK), boiler.maxPressurePa),
             boilerWaterLevelFraction = (boilerWaterMassKg / boiler.waterCapacityKg).coerceIn(0.0, 1.0),
+            boilerScalePercent = boilerScalePercent,
             cylinderPressurePa = cylinderPressurePa,
             crankAngleRad = crankAngleRad,
             angularVelocityRadPerS = angularVelocityRadPerS,
@@ -435,7 +576,10 @@ class SteamEnginePlant(
             maxSupportedRotatingMassKg = frame.maxSupportedRotatingMassKg,
             lubricationPercent = lubricationPercent,
             rotorWindingTemperatureK = rotorWindingTemperatureK,
-            generatorEngaged = clutchEngaged,
+            generatorEngaged = clutchSwitch.effective,
+            circuitBreakerClosed = circuitBreakerSwitch.effective,
+            drainCocksOpen = drainCocksSwitch.effective,
+            blowdownValveOpen = blowdownValveSwitch.effective,
             isDamaged = isDamaged,
             failureReason = failureReason,
         )

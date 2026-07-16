@@ -16,17 +16,14 @@ class SteamEnginePlantTest {
         return plant.status()
     }
 
-    /** Like [runToSteadyState] but tops the oil up so long runs aren't confounded by bearing wear. */
-    private fun runMaintained(plant: SteamEnginePlant, totalSeconds: Double): PlantStatus {
-        val tick = 0.5
-        var elapsed = 0.0
-        while (elapsed < totalSeconds) {
-            plant.step(tick)
-            elapsed += tick
-            if (plant.lubricationPercent < 60.0) plant.addLubrication()
-        }
-        return plant.status()
-    }
+    /**
+     * The lubricator's default feed rate already keeps pace with bearing wear (a real
+     * force-feed lubricator running normally does), so this is just [runToSteadyState] -
+     * kept as a separate name at call sites that specifically want to call out "and this
+     * run isn't testing lubrication at all."
+     */
+    private fun runMaintained(plant: SteamEnginePlant, totalSeconds: Double): PlantStatus =
+        runToSteadyState(plant, totalSeconds)
 
     @Test
     fun `level 1 steam engine settles near 50 watts with default controls`() {
@@ -47,7 +44,7 @@ class SteamEnginePlantTest {
     fun `upgrading boiler and piston increases power output`() {
         val base = runToSteadyState(SteamEnginePlant())
         val upgraded = runToSteadyState(
-            SteamEnginePlant(boiler = Boiler(4), piston = PistonAssembly(3))
+            SteamEnginePlant(boiler = Boiler(3), piston = PistonAssembly(3))
         )
 
         println("base=${base.electricalPowerW}W upgraded=${upgraded.electricalPowerW}W")
@@ -169,8 +166,8 @@ class SteamEnginePlantTest {
     }
 
     @Test
-    fun `depleted lubrication increases friction and can seize a bearing if neglected`() {
-        val neglected = SteamEnginePlant()
+    fun `turning off the lubricator lets friction climb and can seize a bearing`() {
+        val neglected = SteamEnginePlant().apply { lubricatorFeedRateFraction = 0.0 }
         val status = runToSteadyState(neglected, totalSeconds = 20000.0)
 
         println("neglected lubrication result: failure=${status.failureReason} lube=${neglected.lubricationPercent}")
@@ -179,16 +176,13 @@ class SteamEnginePlantTest {
     }
 
     @Test
-    fun `topping up lubrication before it seizes keeps the plant running`() {
+    fun `the lubricator's default feed rate keeps the plant running indefinitely`() {
         val plant = SteamEnginePlant()
-        // Run in chunks, topping the oil up well before it could ever hit zero.
-        repeat(40) {
-            runToSteadyState(plant, totalSeconds = 400.0)
-            plant.addLubrication()
-        }
+        val status = runToSteadyState(plant, totalSeconds = 16000.0)
 
-        assertEquals(FailureReason.NONE, plant.status().failureReason)
-        assertTrue(plant.status().electricalPowerW > 0.0)
+        assertEquals(FailureReason.NONE, status.failureReason)
+        assertTrue(status.electricalPowerW > 0.0)
+        assertTrue(plant.lubricationPercent > 50.0)
     }
 
     @Test
@@ -270,5 +264,114 @@ class SteamEnginePlantTest {
         val status = runToSteadyState(plant, totalSeconds = 180.0)
         assertEquals(FailureReason.NONE, status.failureReason)
         assertTrue(status.electricalPowerW > 0.0)
+    }
+
+    @Test
+    fun `slamming the throttle shut doesn't cut power instantly - the valve has to physically turn`() {
+        val plant = SteamEnginePlant()
+        val fullThrottleStatus = runToSteadyState(plant)
+        plant.throttleFraction = 0.0
+
+        plant.step(0.05)
+        val justAfter = plant.status()
+        println("just after slamming shut: W=${justAfter.electricalPowerW} (was ${fullThrottleStatus.electricalPowerW})")
+        assertTrue(
+            "the valve can't have physically closed yet, power should barely have moved",
+            justAfter.electricalPowerW > fullThrottleStatus.electricalPowerW * 0.85,
+        )
+
+        plant.step(5.0)
+        val longAfter = plant.status()
+        println("5s after slamming shut: W=${longAfter.electricalPowerW}")
+        assertTrue(longAfter.electricalPowerW < fullThrottleStatus.electricalPowerW * 0.2)
+    }
+
+    @Test
+    fun `excitation follows an electrical lag, not an instant field change`() {
+        val plant = SteamEnginePlant()
+        runToSteadyState(plant)
+        plant.excitationFraction = 0.0
+
+        plant.step(0.02)
+        val justAfter = plant.status()
+        plant.step(3.0)
+        val longAfter = plant.status()
+
+        println("excitation lag: justAfter W=${justAfter.electricalPowerW} longAfter W=${longAfter.electricalPowerW}")
+        assertTrue(
+            "field current can't collapse in one tiny substep, some EMF should remain",
+            justAfter.electricalPowerW > longAfter.electricalPowerW,
+        )
+    }
+
+    @Test
+    fun `ignition switch has real throw latency before the burner actually dies`() {
+        val plant = SteamEnginePlant()
+        runToSteadyState(plant)
+        plant.ignitionOn = false
+
+        plant.step(0.1)
+        assertTrue("burner shouldn't be out yet, the switch is still mid-throw", plant.status().heatInputW > 0.0)
+
+        plant.step(1.0)
+        assertEquals(0.0, plant.status().heatInputW, 1e-9)
+    }
+
+    @Test
+    fun `circuit breaker cuts current without removing the rotor's inertia like the clutch does`() {
+        val plant = SteamEnginePlant()
+        runToSteadyState(plant)
+        plant.circuitBreakerClosed = false
+        // Short window: with no electrical braking the shaft is free to speed up (same
+        // over-expansion/overspeed risk as declutching, not what this test is checking),
+        // so just confirm the immediate breaker-specific behavior.
+        plant.step(2.0)
+        val status = plant.status()
+
+        println("breaker open: W=${status.electricalPowerW} clutchStillEngaged=${status.generatorEngaged} failure=${status.failureReason}")
+        assertEquals(0.0, status.electricalPowerW, 1e-9)
+        assertTrue("the clutch itself is untouched by the breaker", status.generatorEngaged)
+    }
+
+    @Test
+    fun `lowering the load rheostat draws more current and changes output`() {
+        val lightLoad = runToSteadyState(SteamEnginePlant().apply { loadRheostatOhm = 4.0 })
+        val heavyLoad = runToSteadyState(SteamEnginePlant().apply { loadRheostatOhm = 0.8 })
+
+        println("lightLoad(4ohm) W=${lightLoad.electricalPowerW} heavyLoad(0.8ohm) W=${heavyLoad.electricalPowerW}")
+        assertTrue(lightLoad.electricalPowerW != heavyLoad.electricalPowerW)
+    }
+
+    @Test
+    fun `air damper far from the optimum wastes combustion heat`() {
+        val optimal = runToSteadyState(SteamEnginePlant())
+        val starvedOfAir = runToSteadyState(SteamEnginePlant().apply { airDamperFraction = 0.0 })
+
+        println("optimalDamper W=${optimal.electricalPowerW} starvedDamper W=${starvedOfAir.electricalPowerW}")
+        assertTrue(starvedOfAir.electricalPowerW < optimal.electricalPowerW)
+    }
+
+    @Test
+    fun `open drain cocks waste working pressure instead of producing torque`() {
+        val closed = runToSteadyState(SteamEnginePlant())
+        val open = runToSteadyState(SteamEnginePlant().apply { drainCocksOpen = true })
+
+        println("drainCocksClosed W=${closed.electricalPowerW} drainCocksOpen W=${open.electricalPowerW}")
+        assertTrue(open.electricalPowerW < closed.electricalPowerW)
+    }
+
+    @Test
+    fun `boiler scale builds up while firing and blowing down purges it`() {
+        val plant = SteamEnginePlant()
+        runToSteadyState(plant, totalSeconds = 12000.0)
+        val scaledStatus = plant.status()
+        println("scale after running: ${scaledStatus.boilerScalePercent}%")
+        assertTrue(scaledStatus.boilerScalePercent > 0.0)
+
+        plant.blowdownValveOpen = true
+        plant.step(60.0)
+        val descaledStatus = plant.status()
+        println("scale after blowdown: ${descaledStatus.boilerScalePercent}%")
+        assertTrue(descaledStatus.boilerScalePercent < scaledStatus.boilerScalePercent)
     }
 }
