@@ -84,6 +84,13 @@ class SteamEnginePlant(
     private val kineticGas = KineticCylinderGas()
     private var previousPhase: CylinderPhase = CylinderPhase.EXHAUST
 
+    /**
+     * The flywheel rim as real mass points and real springs - see [FlywheelLattice].
+     * Burst is a genuine structural failure this lattice reaches on its own, not a
+     * closed-form stress formula.
+     */
+    private val flywheelLattice = FlywheelLattice()
+
     private var secondsAtZeroLubricationWhileRunning: Double = 0.0
     private var secondsDryFiring: Double = 0.0
 
@@ -179,6 +186,7 @@ class SteamEnginePlant(
         crankAngleRad = 0.3
         cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
         kineticGas.reset()
+        flywheelLattice.reset(flywheel)
         previousPhase = CylinderPhase.EXHAUST
         secondsAtZeroLubricationWhileRunning = 0.0
         secondsDryFiring = 0.0
@@ -339,6 +347,18 @@ class SteamEnginePlant(
             val actualH = min(h, remaining)
             integrateSubstep(actualH)
             remaining -= actualH
+        }
+
+        // The lattice's own mechanical relaxation time (microseconds) is far shorter
+        // than a single game tick, so it's checked once per tick against the crank-angle
+        // loop's final angular velocity, not once per crank-angle substep - running its
+        // internal fine-stepping thousands of times per tick instead of once would cost
+        // far more than the quasi-static approximation buys back in accuracy.
+        if (!isDamaged) {
+            flywheelLattice.configure(flywheel)
+            if (!flywheelLattice.step(angularVelocityRadPerS, dtSeconds)) {
+                triggerDamage(FailureReason.FLYWHEEL_BURST)
+            }
         }
     }
 
@@ -621,7 +641,7 @@ class SteamEnginePlant(
             0.0
         }
 
-        checkForDamage(rawSaturationPa, omega)
+        checkForDamage(rawSaturationPa)
     }
 
     /**
@@ -630,19 +650,13 @@ class SteamEnginePlant(
      * actually determines the burst speed, not a per-level number - a bigger rim at the
      * same tip speed carries the exact same stress regardless of level.
      */
-    private fun flywheelHoopStressPa(omega: Double): Double {
-        val tipSpeedMPerS = omega * flywheel.radiusM
-        return PhysicsConstants.CAST_IRON_DENSITY_KG_PER_M3 * tipSpeedMPerS * tipSpeedMPerS
-    }
 
-    private fun checkForDamage(rawBoilerSaturationPa: Double, omega: Double) {
+    private fun checkForDamage(rawBoilerSaturationPa: Double) {
         when {
             secondsDryFiring > dryFireGraceSeconds ->
                 triggerDamage(FailureReason.BOILER_DRY_FIRE)
             rawBoilerSaturationPa > boiler.maxPressurePa * boilerRuptureMargin ->
                 triggerDamage(FailureReason.BOILER_RUPTURED)
-            flywheelHoopStressPa(omega) > PhysicsConstants.CAST_IRON_TENSILE_STRENGTH_PA ->
-                triggerDamage(FailureReason.FLYWHEEL_BURST)
             rotorWindingTemperatureK > rotor.maxWindingTemperatureK ->
                 triggerDamage(FailureReason.ROTOR_BURNOUT)
             secondsAtZeroLubricationWhileRunning > bearingSeizeThresholdSeconds ->

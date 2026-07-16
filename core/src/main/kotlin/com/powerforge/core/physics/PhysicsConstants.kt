@@ -23,6 +23,7 @@ object PhysicsConstants {
     // spinning rim is under, so this is what actually determines a real burst speed. ---
     const val CAST_IRON_DENSITY_KG_PER_M3 = 7200.0
     const val CAST_IRON_TENSILE_STRENGTH_PA = 200e6
+    const val CAST_IRON_YOUNGS_MODULUS_PA = 110e9
 
     // --- Mild steel: the boiler shell and the piston/rod. Real published values. ---
     const val STEEL_DENSITY_KG_PER_M3 = 7850.0
