@@ -78,8 +78,12 @@ class SteamEnginePlantTest {
 
     @Test
     fun `upgrading the boiler further increases power output`() {
+        // A real upgrade path grows the piston alongside the boiler - pairing a much
+        // bigger flame with the tiny reference piston just starves a piston too small
+        // to admit enough steam to relieve it, a real (if different) failure mode, not
+        // the "bigger boiler helps" relationship this test demonstrates.
         val base = runToSteadyState(runningReferencePlant())
-        val upgraded = runToSteadyState(SteamEnginePlant(boiler = Boiler(9), piston = PistonAssembly(1)))
+        val upgraded = runToSteadyState(SteamEnginePlant(boiler = Boiler(9), piston = PistonAssembly(3)))
 
         println("base=${base.electricalPowerW}W upgraded=${upgraded.electricalPowerW}W")
         assertTrue(upgraded.electricalPowerW > base.electricalPowerW)

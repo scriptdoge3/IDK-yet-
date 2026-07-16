@@ -61,9 +61,30 @@ fun PlantControlsPanel(
             HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp))
             SectionLabel("Steam")
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                RotaryValveControl("Throttle", controls.throttleFraction, onThrottleChange)
-                RotaryValveControl("Cutoff", controls.cutoffFraction, onCutoffChange, valueRange = 0.05..0.98)
-                RotaryValveControl("Feedwater", controls.feedwaterValveFraction, onFeedwaterValveChange)
+                // Real open throat area, not an abstract percent - the same real valve
+                // area the compressible-flow calculation itself uses.
+                RotaryValveControl(
+                    "Throttle",
+                    controls.throttleFraction,
+                    onThrottleChange,
+                    valueText = "${(controls.throttleFraction * controls.throttleMaxValveAreaM2 * 1e6).roundToInt()} mm²",
+                )
+                // Real crank-angle degrees of admission, not an abstract percent - a
+                // real operator reads cutoff in degrees of stroke, not "percent."
+                RotaryValveControl(
+                    "Cutoff",
+                    controls.cutoffFraction,
+                    onCutoffChange,
+                    valueRange = 0.05..0.98,
+                    valueText = "${(controls.cutoffFraction * 180.0).roundToInt()}°",
+                )
+                // Real volumetric flow rate, not an abstract percent.
+                RotaryValveControl(
+                    "Feedwater",
+                    controls.feedwaterValveFraction,
+                    onFeedwaterValveChange,
+                    valueText = "${"%.1f".format(controls.feedwaterValveFraction * controls.feedwaterMaxFlowKgPerS * 1000.0)} mL/s",
+                )
             }
             Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                 ToggleLever("Relief valve", controls.safetyValveOpen, onSafetyValveChange)

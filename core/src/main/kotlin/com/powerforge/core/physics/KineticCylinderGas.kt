@@ -95,7 +95,15 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
     private var activeCount = 0
 
     private var rng = Random(0x5eed_1234)
-    private var injectionAccumulatorKg = 0.0
+
+    /**
+     * Net pending real mass transfer through the valve, positive (owed an injection)
+     * or negative (owed an eviction back out) - a single signed running total, not two
+     * separate one-way tallies, so a flow that reverses mid-stream genuinely has to
+     * drain back through zero first, the same as a real valve's real trapped charge
+     * would.
+     */
+    private var netFlowAccumulatorKg = 0.0
 
     /**
      * Running estimate of the fastest relative approach speed seen; NTC needs this to
@@ -119,11 +127,14 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
         private set
 
     /**
-     * The mass actually accepted into the simulation on the last [substep] call - can
-     * fall short of the requested valve flow once the particle budget is full. The
-     * boiler's energy bookkeeping must charge for this, not the requested flow, or
-     * steam the chamber physically had no room to represent would still be silently
-     * draining latent heat from the boiler forever.
+     * The real net mass that actually crossed the valve on the last [substep] call -
+     * can fall short of the requested inflow once the particle budget is full, and can
+     * be negative (real mass venting back upstream) even when a positive flow was
+     * requested, if enough of it was still needed to pay down a pending eviction from
+     * a previous substep's reverse flow. The boiler's energy bookkeeping charges (or
+     * credits) for this real net amount, not the requested flow, or steam the chamber
+     * physically had no room to represent - or gave back - would still be silently
+     * drained from (or never returned to) the boiler.
      */
     var lastActualMassFlowKgPerS: Double = 0.0
         private set
@@ -174,7 +185,7 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
      */
     fun reset() {
         activeCount = 0
-        injectionAccumulatorKg = 0.0
+        netFlowAccumulatorKg = 0.0
         lastPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
         lastTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
         relativeSpeedMaxEstimateMPerS =
@@ -197,16 +208,26 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
      * wall/piston collisions exactly for the duration of [dt]. Returns the pressure
      * that genuinely resulted from momentum transferred to the piston face.
      *
+     * [massFlowInKgPerS] can be negative - a real open valve doesn't only ever admit;
+     * whenever the trapped charge is genuinely at higher pressure than upstream (a
+     * stalled engine's admission window left open long enough for real statistical
+     * fluctuation to push it there, for instance), the same valve genuinely vents mass
+     * back out through it. See [lastActualMassFlowKgPerS].
+     *
      * [pistonPositionM] is the moving wall's position (the valve/clearance end is the
      * fixed wall at x=0), [pistonVelocityMPerS] its velocity, [halfWidthM] the lateral
      * (bore) confinement, [pistonAreaM2] the real piston face area pressure is
      * measured against, [sourceDensityKgPerM3] the real density of the steam at the
      * boiler's current pressure and temperature (used only to turn the already-real
      * mass flow rate into a bulk velocity via mass conservation, m-dot = rho*A*v - not
-     * an assumed injection speed), and [fullChamberMassEstimateKg] the mass the
-     * chamber would hold completely full at boiler density - used only to size the
-     * DSMC scaling factor so the fixed particle budget stays meaningful whether this
-     * is a level-1 toy engine or a level-20 monster.
+     * an assumed injection speed), [fullChamberMassEstimateKg] the mass the chamber
+     * would hold completely full at boiler density - used only to size the DSMC
+     * scaling factor so the fixed particle budget stays meaningful whether this is a
+     * level-1 toy engine or a level-20 monster - and [wallHeatLossW] the real
+     * conductive heat loss to (or, when negative, gain from) the cylinder's own metal
+     * wall (see [PistonAssembly.insulationLossWPerK]), genuinely removed from or added
+     * to the represented ensemble's real kinetic energy, not folded into an assumed
+     * temperature.
      */
     fun substep(
         massFlowInKgPerS: Double,
@@ -217,6 +238,7 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
         pistonVelocityMPerS: Double,
         halfWidthM: Double,
         pistonAreaM2: Double,
+        wallHeatLossW: Double,
         dt: Double,
     ): Double {
         lastChamberLengthM = pistonPositionM
@@ -226,9 +248,10 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
             fullChamberMassEstimateKg / TARGET_PARTICLE_COUNT,
         )
 
+        netFlowAccumulatorKg += massFlowInKgPerS * dt
+
         var particlesInjectedThisCall = 0
         if (massFlowInKgPerS > 0.0) {
-            injectionAccumulatorKg += massFlowInKgPerS * dt
             val thermalSpeedMPerS = sqrt(BOLTZMANN_J_PER_K * sourceTemperatureK / WATER_MOLECULE_MASS_KG)
             // Bulk inward drift from mass conservation (m-dot = rho*A*v, solved for v),
             // using the same real density and the same piston-face area the rest of this
@@ -239,8 +262,8 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
             // this bulk drift keeps driving the piston even as collisions isotropize the
             // random thermal spread around it every substep.
             val bulkInwardVelocityMPerS = massFlowInKgPerS / max(1e-6, sourceDensityKgPerM3 * pistonAreaM2)
-            while (injectionAccumulatorKg >= particleMassKg) {
-                injectionAccumulatorKg -= particleMassKg
+            while (netFlowAccumulatorKg >= particleMassKg) {
+                netFlowAccumulatorKg -= particleMassKg
                 particlesInjectedThisCall++
                 // Once the particle budget is full, real mass would still keep entering a
                 // real chamber (it would just get denser); our simulation can't add more
@@ -261,7 +284,27 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
                 vy[i] = gaussianSample() * thermalSpeedMPerS
             }
         }
-        lastActualMassFlowKgPerS = particlesInjectedThisCall * particleMassKg / dt
+
+        // Real reverse flow: whenever the trapped charge has genuinely (even if only
+        // by real statistical fluctuation in a small ensemble) ended up at higher
+        // pressure than the upstream side, the same open valve lets real mass vent
+        // back out through it. Without this, the valve behaves like a one-way check
+        // valve that only ever adds particles and never removes them - every random
+        // upward fluctuation ratchets in for good with nothing to reverse it, which
+        // over enough substeps drives the chamber to a pressure nothing upstream of
+        // it ever actually reached.
+        var particlesEvictedThisCall = 0
+        while (netFlowAccumulatorKg <= -particleMassKg && activeCount > 0) {
+            netFlowAccumulatorKg += particleMassKg
+            particlesEvictedThisCall++
+            val victim = rng.nextInt(activeCount)
+            val last = activeCount - 1
+            x[victim] = x[last]; y[victim] = y[last]
+            vx[victim] = vx[last]; vy[victim] = vy[last]
+            activeCount--
+        }
+
+        lastActualMassFlowKgPerS = (particlesInjectedThisCall - particlesEvictedThisCall) * particleMassKg / dt
 
         var i = 0
         while (i < activeCount) {
@@ -328,6 +371,48 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
 
         val chamberVolumeForCollisionsM3 = max(1e-12, pistonAreaM2 * pistonPositionM)
         collideParticles(chamberVolumeForCollisionsM3, dt, particleMassKg)
+
+        // Real conductive exchange with the cylinder wall - genuinely removing (or,
+        // when the gas has over-expanded colder than ambient, adding) kinetic energy
+        // from the represented ensemble by rescaling every particle's speed, the same
+        // bidirectional Newtonian-cooling treatment the boiler's own insulation loss
+        // uses. Uses the real Fn-scaled particle mass (not the real single-molecule
+        // mass the temperature calculation below uses) because wallHeatLossW is a
+        // real macroscopic power removed from the real full charge, not one molecule.
+        if (activeCount > 0 && wallHeatLossW != 0.0) {
+            var totalRepresentedKineticEnergyJ = 0.0
+            for (p in 0 until activeCount) {
+                totalRepresentedKineticEnergyJ += vx[p] * vx[p] + vy[p] * vy[p]
+            }
+            totalRepresentedKineticEnergyJ *= 0.5 * particleMassKg
+            val newEnergyJ = max(0.0, totalRepresentedKineticEnergyJ - wallHeatLossW * dt)
+            if (totalRepresentedKineticEnergyJ > 1e-12) {
+                val velocityScale = sqrt(newEnergyJ / totalRepresentedKineticEnergyJ)
+                for (p in 0 until activeCount) {
+                    vx[p] *= velocityScale
+                    vy[p] *= velocityScale
+                }
+            } else if (newEnergyJ > 1e-12) {
+                // A trapped, unreplenished charge (stuck in EXPANSION with the piston
+                // not moving, say) can have a single substep's real wall loss exceed
+                // the tiny kinetic energy it actually has left, landing exactly on
+                // zero above - but the wall still owes it real heat back once it's
+                // colder than ambient (wallHeatLossW negative), the same degenerate
+                // case BoilerThermalSimulation's own bidirectional exchange handles by
+                // reseeding fresh Maxwell-Boltzmann velocities at the temperature
+                // newEnergyJ actually implies, rather than rescaling zero by anything
+                // (0 times any scale is still 0) and leaving it frozen forever with no
+                // path back to equilibrium.
+                val realMoleculesPerParticle = particleMassKg / WATER_MOLECULE_MASS_KG
+                val realMoleculeCount = activeCount * realMoleculesPerParticle
+                val impliedTemperatureK = newEnergyJ / (realMoleculeCount * BOLTZMANN_J_PER_K)
+                val thermalSpeedMPerS = sqrt(BOLTZMANN_J_PER_K * impliedTemperatureK / WATER_MOLECULE_MASS_KG)
+                for (p in 0 until activeCount) {
+                    vx[p] = gaussianSample() * thermalSpeedMPerS
+                    vy[p] = gaussianSample() * thermalSpeedMPerS
+                }
+            }
+        }
 
         // Temperature is per-molecule (intensive), so it has to come from the real
         // molecular mass, not the Fn-scaled macro-particle mass - each simulated

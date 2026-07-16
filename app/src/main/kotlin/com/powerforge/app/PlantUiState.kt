@@ -43,6 +43,10 @@ data class ControlsUiState(
     val blowdownValveOpen: Boolean = false,
     val lubricationPercent: Double = 100.0,
     val boilerScalePercent: Double = 0.0,
+    /** The throttle valve's real fully-open throat area - scales with the piston's real bore. */
+    val throttleMaxValveAreaM2: Double = 0.0,
+    /** The feedwater pump/valve's real maximum flow rate - scales with the boiler's real level. */
+    val feedwaterMaxFlowKgPerS: Double = 0.0,
 )
 
 data class PlantUiState(

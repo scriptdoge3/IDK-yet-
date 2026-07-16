@@ -27,8 +27,12 @@ private const val SWEEP_DEGREES = 270f
 
 /**
  * A real analog instrument dial: a needle sweeps 270 degrees from [minValue] to [maxValue],
- * with an optional red danger band past [dangerValue]. The needle is spring-damped rather
- * than snapping straight to the value, the way a real gauge's mechanism has inertia.
+ * with an optional red danger band past [dangerValue]. The needle is critically damped
+ * (no overshoot) rather than snapping straight to the value, the way a real gauge's
+ * mechanism has inertia - manufacturers deliberately damp real gauges this way so a
+ * noisy real reading doesn't make the needle flutter or hunt back and forth. The printed
+ * number underneath follows that same damped needle position, not the raw instantaneous
+ * value - a real gauge only has one reading, not a jittery digit next to a smooth needle.
  */
 @Composable
 fun GaugeDial(
@@ -39,12 +43,11 @@ fun GaugeDial(
     unit: String,
     modifier: Modifier = Modifier,
     dangerValue: Float? = null,
-    valueText: String = formatGaugeValue(value),
     diameter: androidx.compose.ui.unit.Dp = 96.dp,
 ) {
     val animatedValue by animateFloatAsState(
         targetValue = value.coerceIn(minValue, maxValue),
-        animationSpec = spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessLow),
+        animationSpec = spring(dampingRatio = 1f, stiffness = Spring.StiffnessVeryLow),
         label = "gaugeNeedle",
     )
 
@@ -115,7 +118,7 @@ fun GaugeDial(
             }
 
             Text(
-                text = "$valueText$unit",
+                text = "${formatGaugeValue(animatedValue)}$unit",
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurface,

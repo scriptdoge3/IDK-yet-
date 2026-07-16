@@ -2,6 +2,7 @@ package com.powerforge.app.ui
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
@@ -24,10 +25,23 @@ import kotlin.math.sin
 private const val SWEEP_START_DEGREES = 135.0
 private const val SWEEP_DEGREES = 270.0
 
+private fun angleFromCenterDeg(center: Offset, point: Offset): Double =
+    Math.toDegrees(atan2((point.y - center.y).toDouble(), (point.x - center.x).toDouble()))
+
+private fun angleToFraction(angleDeg: Double): Double {
+    val normalized = if (angleDeg < SWEEP_START_DEGREES) angleDeg + 360.0 else angleDeg
+    return ((normalized - SWEEP_START_DEGREES) / SWEEP_DEGREES).coerceIn(0.0, 1.0)
+}
+
 /**
- * A valve wheel you turn, not a slider you drag sideways - touch anywhere on the dial
- * and it turns to point at your finger, same 270-degree sweep language as [GaugeDial]
- * so setting a control and reading its gauge feel like the same physical vocabulary.
+ * A valve wheel you turn, not a slider you drag sideways - same 270-degree sweep
+ * language as [GaugeDial] so setting a control and reading its gauge feel like the
+ * same physical vocabulary. Tapping anywhere on the dial jumps straight to that
+ * position (like grabbing a real valve wheel spoke), and dragging turns it by the
+ * real angle your finger has swept around the center since the last frame - not by
+ * jumping to your finger's absolute angle, which makes a real dial feel wildly
+ * oversensitive near its own center (a tiny position wobble there swings across a
+ * huge angle) and doesn't behave like actually turning something.
  */
 @Composable
 fun RotaryValveControl(
@@ -44,21 +58,41 @@ fun RotaryValveControl(
         val faceColor = MaterialTheme.colorScheme.surface
         val rimColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
         val trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f)
+        val rangeSpan = valueRange.endInclusive - valueRange.start
 
         Canvas(
             modifier = modifier
                 .size(diameter)
                 .pointerInput(valueRange) {
-                    detectDragGestures { change, _ ->
+                    detectTapGestures { tapPosition ->
+                        val center = Offset(size.width / 2f, size.height / 2f)
+                        val fraction = angleToFraction(angleFromCenterDeg(center, tapPosition))
+                        onValueChange(valueRange.start + fraction * rangeSpan)
+                    }
+                }
+                .pointerInput(valueRange) {
+                    var lastAngleDeg: Double? = null
+                    detectDragGestures(
+                        onDragStart = { lastAngleDeg = null },
+                        onDragEnd = { lastAngleDeg = null },
+                        onDragCancel = { lastAngleDeg = null },
+                    ) { change, _ ->
                         change.consume()
                         val center = Offset(size.width / 2f, size.height / 2f)
-                        val touch = change.position
-                        val rawDeg = Math.toDegrees(
-                            atan2((touch.y - center.y).toDouble(), (touch.x - center.x).toDouble()),
-                        )
-                        val normalizedDeg = if (rawDeg < SWEEP_START_DEGREES) rawDeg + 360.0 else rawDeg
-                        val fraction = ((normalizedDeg - SWEEP_START_DEGREES) / SWEEP_DEGREES).coerceIn(0.0, 1.0)
-                        onValueChange(valueRange.start + fraction * (valueRange.endInclusive - valueRange.start))
+                        val currentAngleDeg = angleFromCenterDeg(center, change.position)
+                        val previous = lastAngleDeg
+                        if (previous != null) {
+                            // Shortest angular step since the last frame, so crossing the
+                            // dial's +-180 degree seam doesn't register as a huge jump.
+                            var deltaDeg = currentAngleDeg - previous
+                            if (deltaDeg > 180.0) deltaDeg -= 360.0
+                            if (deltaDeg < -180.0) deltaDeg += 360.0
+                            val deltaFraction = deltaDeg / SWEEP_DEGREES
+                            val currentFraction = ((value - valueRange.start) / rangeSpan).coerceIn(0.0, 1.0)
+                            val nextFraction = (currentFraction + deltaFraction).coerceIn(0.0, 1.0)
+                            onValueChange(valueRange.start + nextFraction * rangeSpan)
+                        }
+                        lastAngleDeg = currentAngleDeg
                     }
                 },
         ) {
@@ -75,7 +109,7 @@ fun RotaryValveControl(
                 style = Stroke(width = radius * 0.16f, cap = StrokeCap.Round),
             )
 
-            val fraction = ((value - valueRange.start) / (valueRange.endInclusive - valueRange.start)).coerceIn(0.0, 1.0)
+            val fraction = ((value - valueRange.start) / rangeSpan).coerceIn(0.0, 1.0)
             drawArc(
                 color = knobColor,
                 startAngle = SWEEP_START_DEGREES.toFloat(),

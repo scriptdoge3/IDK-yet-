@@ -65,6 +65,40 @@ class SteamEnginePlant(
     var rotorWindingTemperatureK: Double = PhysicsConstants.AMBIENT_TEMPERATURE_K
         private set
 
+    /**
+     * A real time-weighted average of the boiler's actual instantaneous temperature
+     * across every crank-angle substep since it was last read, for reporting - not a
+     * separate physical quantity. [boilerTemperatureK] itself stays the true
+     * instantaneous state the physics actually integrates substep to substep (rupture
+     * checks, admission flow, everything else needs that, not a smoothed value); a
+     * single game tick already resolves tens to hundreds of real substeps (see
+     * [step]), each its own independent water-particle-ensemble read, so this is
+     * properly averaging real information the simulation already computed, not
+     * reporting only the very last substep's one noisy sample and discarding the rest.
+     */
+    var reportedBoilerTemperatureK: Double = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        private set
+
+    /**
+     * The same real averaging as [reportedBoilerTemperatureK], but reset at every real
+     * admission/expansion/exhaust phase transition instead of every game tick: the
+     * cylinder genuinely alternates between a working phase and flat atmospheric
+     * exhaust twice a revolution (a real double-acting engine's actual pressure
+     * trace) - averaging straight across that boundary would blend two genuinely
+     * different real states into a number that represents neither. This instead
+     * reports the running average of whichever phase is currently underway.
+     */
+    var reportedCylinderPressurePa: Double = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
+        private set
+    var reportedCylinderTemperatureK: Double = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        private set
+
+    private var boilerTemperatureAccumulatorK = 0.0
+    private var boilerTemperatureWeightSeconds = 0.0
+    private var cylinderPressureAccumulatorPa = 0.0
+    private var cylinderTemperatureAccumulatorK = 0.0
+    private var cylinderWeightSeconds = 0.0
+
     var lubricationPercent: Double = 100.0
         private set
 
@@ -189,9 +223,17 @@ class SteamEnginePlant(
         boilerWaterMassKg = boiler.waterCapacityKg
         boilerScalePercent = 0.0
         boilerTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        reportedBoilerTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
         angularVelocityRadPerS = 0.0
         crankAngleRad = 0.3
         cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
+        reportedCylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
+        reportedCylinderTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        boilerTemperatureAccumulatorK = 0.0
+        boilerTemperatureWeightSeconds = 0.0
+        cylinderPressureAccumulatorPa = 0.0
+        cylinderTemperatureAccumulatorK = 0.0
+        cylinderWeightSeconds = 0.0
         kineticGas.reset()
         flywheelLattice.reset(flywheel)
         boilerThermal.reset()
@@ -220,6 +262,23 @@ class SteamEnginePlant(
     private val bearingSeizeThresholdSeconds = 90.0
     private val dryFireGraceSeconds = 0.5
     private val emergencyBrakeTorqueNm = 40.0
+
+    /**
+     * A numerical-resolution threshold, not a physics value (same spirit as
+     * [KineticCylinderGas.TARGET_PARTICLE_COUNT] itself): below this many real
+     * particles, a momentum-flux pressure estimate carries too much real statistical
+     * noise (relative sampling error falls off as 1/sqrt(N)) to trust for deciding
+     * whether the cylinder gas should genuinely vent back into the boiler. Set close
+     * to the target population itself rather than just "enough to not be tiny": a
+     * genuinely stalled admission phase (the real scenario this exists to protect
+     * against) sits there for seconds - hundreds of substeps, plenty of time to
+     * reach a fully-populated, low-noise ensemble - while an ordinary fast-cycling
+     * running engine's admission window is far shorter and never reaches a large
+     * count at all, so this only ever engages once a reading is genuinely trustworthy,
+     * not on the ordinary statistical noise a partially-filled, still-actively-running
+     * ensemble already has.
+     */
+    private val MIN_PARTICLES_TO_TRUST_FOR_REVERSE_FLOW = 150
 
     /**
      * The real ratio between what the shell actually bursts at and what it's rated to
@@ -351,10 +410,27 @@ class SteamEnginePlant(
         }
         val h = max(minSubstepSeconds, dtSeconds / maxSubsteps)
         var remaining = dtSeconds
+        boilerTemperatureAccumulatorK = 0.0
+        boilerTemperatureWeightSeconds = 0.0
         while (remaining > 1e-9) {
             val actualH = min(h, remaining)
             integrateSubstep(actualH)
             remaining -= actualH
+        }
+        reportedBoilerTemperatureK = if (boilerTemperatureWeightSeconds > 1e-9) {
+            boilerTemperatureAccumulatorK / boilerTemperatureWeightSeconds
+        } else {
+            boilerTemperatureK
+        }
+        reportedCylinderPressurePa = if (cylinderWeightSeconds > 1e-9) {
+            cylinderPressureAccumulatorPa / cylinderWeightSeconds
+        } else {
+            cylinderPressurePa
+        }
+        reportedCylinderTemperatureK = if (cylinderWeightSeconds > 1e-9) {
+            cylinderTemperatureAccumulatorK / cylinderWeightSeconds
+        } else {
+            kineticGas.lastTemperatureK
         }
 
         // The lattice's own mechanical relaxation time (microseconds) is far shorter
@@ -429,19 +505,67 @@ class SteamEnginePlant(
                 CylinderPhase.EXPANSION -> { /* carry the trapped charge straight into expansion */ }
             }
             previousPhase = phase
+            cylinderPressureAccumulatorPa = 0.0
+            cylinderTemperatureAccumulatorK = 0.0
+            cylinderWeightSeconds = 0.0
         }
 
         var steamMassFlowIntoCylinderKgPerS = 0.0
-        when (phase) {
-            CylinderPhase.ADMISSION, CylinderPhase.EXPANSION -> {
+        when {
+            phase == CylinderPhase.EXPANSION && kineticGas.particleCount == 0 -> {
+                // Nothing was ever trapped to expand - a real admission window that, by
+                // chance, never actually accumulated enough flow to inject a single
+                // particle before cutoff ended it. A genuinely empty chamber has no
+                // charge of its own to read a pressure off, so it reads as whatever
+                // it's actually exposed to: atmospheric, the same real fallback the
+                // exhaust phase already uses - not a fictional near-total vacuum with
+                // no real gas behind it (which would otherwise apply a real vacuum-drag
+                // force that has nothing real backing it).
+                cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
+            }
+            phase == CylinderPhase.ADMISSION || phase == CylinderPhase.EXPANSION -> {
                 val flow = if (phase == CylinderPhase.ADMISSION) {
-                    compressibleMassFlowKgPerS(
-                        areaM2 = throttleAreaM2,
-                        dischargeCoefficient = 0.85,
-                        upstreamPressurePa = boilerPressurePa,
-                        upstreamTemperatureK = boilerTemperatureK,
-                        downstreamPressurePa = kineticGas.lastPressurePa,
-                    )
+                    // A real open valve doesn't only ever admit - if the trapped charge
+                    // has genuinely ended up at higher pressure than the boiler (real
+                    // statistical fluctuation in a small stalled-engine ensemble can do
+                    // this, same as any small real system), the same open throat vents
+                    // real mass back out through it. Without this, a one-way check-valve
+                    // model lets every random upward fluctuation ratchet in for good,
+                    // walking a stalled engine's trapped pressure past what the boiler
+                    // itself ever actually reached. Gated on the chamber already holding
+                    // a real enough sample to trust: a freshly-admitted handful of
+                    // particles has real, large statistical variance in its momentum-
+                    // flux pressure estimate (the same reason a tiny opinion poll is
+                    // noisy and a large one isn't) - reading that noise as "genuinely
+                    // over-pressure, vent it" would evict the ensemble right back to
+                    // empty before it ever got a real chance to build up, a self-
+                    // defeating loop with no physical basis. kineticGas.lastPressurePa's
+                    // reset baseline is also just a real placeholder for "just vented to
+                    // atmosphere", not a genuine reading of an ensemble that doesn't
+                    // exist yet - many of these boilers genuinely run below atmospheric
+                    // in absolute terms too (water isn't at atmospheric pressure until
+                    // it's genuinely at 373K), which would otherwise misread that
+                    // placeholder as "cylinder already higher" before a single real
+                    // particle exists.
+                    if (kineticGas.particleCount < MIN_PARTICLES_TO_TRUST_FOR_REVERSE_FLOW ||
+                        boilerPressurePa >= kineticGas.lastPressurePa
+                    ) {
+                        compressibleMassFlowKgPerS(
+                            areaM2 = throttleAreaM2,
+                            dischargeCoefficient = 0.85,
+                            upstreamPressurePa = boilerPressurePa,
+                            upstreamTemperatureK = boilerTemperatureK,
+                            downstreamPressurePa = kineticGas.lastPressurePa,
+                        )
+                    } else {
+                        -compressibleMassFlowKgPerS(
+                            areaM2 = throttleAreaM2,
+                            dischargeCoefficient = 0.85,
+                            upstreamPressurePa = kineticGas.lastPressurePa,
+                            upstreamTemperatureK = kineticGas.lastTemperatureK,
+                            downstreamPressurePa = boilerPressurePa,
+                        )
+                    }
                 } else {
                     0.0 // valve is shut past cutoff - the trapped charge just keeps expanding
                 }
@@ -456,6 +580,12 @@ class SteamEnginePlant(
                 val referenceTemperatureK = saturationTemperatureK(boiler.maxPressurePa)
                 val fullChamberMassEstimateKg = (piston.clearanceVolumeM3 + piston.sweptVolumeM3) *
                     steamDensityKgPerM3(boiler.maxPressurePa, referenceTemperatureK)
+                // Bidirectional (see BoilerThermalSimulation's own insulation loss for
+                // the same reasoning): a gas hotter than ambient loses real heat to the
+                // wall, but a charge that's over-expanded colder than ambient gains real
+                // heat back from it too - not a one-way ratchet.
+                val cylinderWallHeatLossW = piston.insulationLossWPerK *
+                    (kineticGas.lastTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
                 cylinderPressurePa = kineticGas.substep(
                     massFlowInKgPerS = flow,
                     sourceTemperatureK = boilerTemperatureK,
@@ -465,6 +595,7 @@ class SteamEnginePlant(
                     pistonVelocityMPerS = pistonVelocityMPerS,
                     halfWidthM = piston.boreRadiusM,
                     pistonAreaM2 = piston.pistonAreaM2,
+                    wallHeatLossW = cylinderWallHeatLossW,
                     dt = dt,
                 )
                 // Charge the boiler for what the chamber actually had room to represent,
@@ -472,10 +603,13 @@ class SteamEnginePlant(
                 // the two can diverge, and the energy balance has to follow the real one.
                 steamMassFlowIntoCylinderKgPerS = kineticGas.lastActualMassFlowKgPerS
             }
-            CylinderPhase.EXHAUST -> {
+            else -> { // CylinderPhase.EXHAUST
                 cylinderPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
             }
         }
+        cylinderPressureAccumulatorPa += cylinderPressurePa * dt
+        cylinderTemperatureAccumulatorK += kineticGas.lastTemperatureK * dt
+        cylinderWeightSeconds += dt
 
         // Open drain cocks bleed most of the working pressure straight to atmosphere instead of
         // doing work - correct procedure for a cold start (clears condensate) but a real loss
@@ -648,6 +782,8 @@ class SteamEnginePlant(
             insulationLossW = nonFlameHeatLossW,
             dt = dt,
         )
+        boilerTemperatureAccumulatorK += boilerTemperatureK * dt
+        boilerTemperatureWeightSeconds += dt
 
         boilerWaterMassKg = (boilerWaterMassKg + (feedwaterMassFlowKgPerS - waterOutflowKgPerS) * dt)
             .coerceIn(0.0, boiler.waterCapacityKg)
@@ -696,6 +832,8 @@ class SteamEnginePlant(
             insulationLossW = heatLossToEnvironmentW,
             dt = dt,
         )
+        boilerTemperatureAccumulatorK += boilerTemperatureK * dt
+        boilerTemperatureWeightSeconds += dt
         val windingCoolingW = 0.8 * (rotorWindingTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
         rotorWindingTemperatureK = max(
             PhysicsConstants.AMBIENT_TEMPERATURE_K,
@@ -732,12 +870,12 @@ class SteamEnginePlant(
             0.0
         }
         return PlantStatus(
-            boilerTemperatureK = boilerTemperatureK,
-            boilerPressurePa = min(saturationPressurePa(boilerTemperatureK), boiler.maxPressurePa),
+            boilerTemperatureK = reportedBoilerTemperatureK,
+            boilerPressurePa = min(saturationPressurePa(reportedBoilerTemperatureK), boiler.maxPressurePa),
             boilerWaterLevelFraction = (boilerWaterMassKg / boiler.waterCapacityKg).coerceIn(0.0, 1.0),
             boilerScalePercent = boilerScalePercent,
-            cylinderPressurePa = cylinderPressurePa,
-            cylinderTemperatureK = kineticGas.lastTemperatureK,
+            cylinderPressurePa = reportedCylinderPressurePa,
+            cylinderTemperatureK = reportedCylinderTemperatureK,
             crankAngleRad = crankAngleRad,
             angularVelocityRadPerS = angularVelocityRadPerS,
             rpm = angularVelocityRadPerS * 60.0 / (2.0 * PI),
@@ -754,7 +892,7 @@ class SteamEnginePlant(
             blowdownValveOpen = blowdownValveSwitch.effective,
             flameActive = effectiveHeatInputW > 0.0,
             flywheelStressFraction = flywheelLattice.stressFraction,
-            boilerStressFraction = saturationPressurePa(boilerTemperatureK) / (boiler.maxPressurePa * boilerRuptureMargin),
+            boilerStressFraction = saturationPressurePa(reportedBoilerTemperatureK) / (boiler.maxPressurePa * boilerRuptureMargin),
             windingStressFraction = rotorWindingTemperatureK / rotor.maxWindingTemperatureK,
             isDamaged = isDamaged,
             failureReason = failureReason,

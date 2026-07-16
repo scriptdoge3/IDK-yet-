@@ -33,11 +33,44 @@ import com.powerforge.app.PlantViewModel
 import com.powerforge.core.physics.FailureReason
 import kotlin.math.roundToInt
 
+/**
+ * Real gauge-damped copies of every reading that's genuinely noisy tick-to-tick in
+ * the underlying physics (see [rememberDampedReading]) - RPM is included too since
+ * a real tachometer has its own inertia, even though the flywheel's real rotational
+ * inertia already makes it far smoother than the raw particle-ensemble pressure and
+ * temperature readouts. Water level and the crank angle/RPM feeding the animated
+ * mechanism drawing are deliberately left out - those already have their own
+ * appropriate real-time behavior.
+ */
+@Composable
+private fun PlantUiState.damped(): PlantUiState = copy(
+    boilerPressurePa = rememberDampedReading(boilerPressurePa),
+    boilerTemperatureK = rememberDampedReading(boilerTemperatureK),
+    cylinderPressurePa = rememberDampedReading(cylinderPressurePa),
+    cylinderTemperatureK = rememberDampedReading(cylinderTemperatureK),
+    boilerStressFraction = rememberDampedReading(boilerStressFraction),
+    flywheelStressFraction = rememberDampedReading(flywheelStressFraction),
+    windingStressFraction = rememberDampedReading(windingStressFraction),
+    rotorWindingTemperatureK = rememberDampedReading(rotorWindingTemperatureK),
+    electricalPowerW = rememberDampedReading(electricalPowerW),
+    overallEfficiency = rememberDampedReading(overallEfficiency),
+    rpm = rememberDampedReading(rpm),
+)
+
 @Composable
 fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Modifier) {
     val state by viewModel.uiState.collectAsState()
     val latestState = rememberUpdatedState(state)
     var visualMode by remember { mutableStateOf(EngineVisualMode.NORMAL) }
+
+    // Pressure and temperature come straight off a fresh particle-ensemble snapshot
+    // every tick with no inertia of their own in the physics (unlike RPM, which
+    // already has the real flywheel's rotational inertia built in) - genuinely noisy
+    // instant-to-instant from a small particle count. A single damped reading of each
+    // is computed once here (see rememberDampedReading) and shared by every display
+    // of it - the gauges, the legend, and the engine visual's own coloring - so they
+    // never disagree with each other.
+    val dampedState = state.damped()
 
     Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -53,25 +86,25 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Mo
                 mode = visualMode,
                 rpmProvider = { latestState.value.rpm },
                 crankAngleRadProvider = { latestState.value.crankAngleRad },
-                cylinderPressurePa = state.cylinderPressurePa,
-                cylinderTemperatureK = state.cylinderTemperatureK,
+                cylinderPressurePa = dampedState.cylinderPressurePa,
+                cylinderTemperatureK = dampedState.cylinderTemperatureK,
                 cylinderParticles = state.cylinderParticles,
-                boilerTemperatureK = state.boilerTemperatureK,
+                boilerTemperatureK = dampedState.boilerTemperatureK,
                 boilerWaterLevelFraction = state.boilerWaterLevelFraction,
-                boilerStressFraction = state.boilerStressFraction,
-                flywheelStressFraction = state.flywheelStressFraction,
+                boilerStressFraction = dampedState.boilerStressFraction,
+                flywheelStressFraction = dampedState.flywheelStressFraction,
                 flywheelLatticePoints = state.flywheelLatticePoints,
                 flywheelRadiusM = state.flywheelRadiusM,
-                windingStressFraction = state.windingStressFraction,
-                rotorWindingTemperatureK = state.rotorWindingTemperatureK,
+                windingStressFraction = dampedState.windingStressFraction,
+                rotorWindingTemperatureK = dampedState.rotorWindingTemperatureK,
                 flameActive = state.flameActive,
                 generatorEngaged = state.controls.clutchEngaged && state.controls.circuitBreakerClosed,
-                electricalPowerW = state.electricalPowerW,
+                electricalPowerW = dampedState.electricalPowerW,
                 isFailing = state.isFailing,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
             )
 
-            EngineVisualLegend(mode = visualMode, state = state)
+            EngineVisualLegend(mode = visualMode, state = dampedState)
 
             if (state.isDamaged) {
                 DamageBanner(state, onRepair = viewModel::repair)
@@ -79,8 +112,8 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Mo
                 WarningBanner(state)
             }
 
-            GaugeCluster(state)
-            SecondaryReadouts(state)
+            GaugeCluster(state, dampedState)
+            SecondaryReadouts(dampedState)
 
             LazyColumn(
                 modifier = Modifier.fillMaxWidth().weight(1f),
@@ -218,14 +251,14 @@ private fun EngineVisualLegend(mode: EngineVisualMode, state: PlantUiState) {
 }
 
 @Composable
-private fun GaugeCluster(state: PlantUiState) {
+private fun GaugeCluster(state: PlantUiState, damped: PlantUiState) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.SpaceEvenly,
     ) {
         GaugeDial(
             label = "Pressure",
-            value = (state.boilerPressurePa / 1000.0).toFloat(),
+            value = (damped.boilerPressurePa / 1000.0).toFloat(),
             minValue = 0f,
             maxValue = 900f,
             unit = " kPa",
@@ -233,7 +266,7 @@ private fun GaugeCluster(state: PlantUiState) {
         )
         GaugeDial(
             label = "RPM",
-            value = state.rpm.toFloat(),
+            value = damped.rpm.toFloat(),
             minValue = 0f,
             maxValue = 3000f,
             unit = "",
@@ -241,7 +274,7 @@ private fun GaugeCluster(state: PlantUiState) {
         )
         GaugeDial(
             label = "Boiler",
-            value = (state.boilerTemperatureK - 273.15).toFloat(),
+            value = (damped.boilerTemperatureK - 273.15).toFloat(),
             minValue = 0f,
             maxValue = 300f,
             unit = "°C",

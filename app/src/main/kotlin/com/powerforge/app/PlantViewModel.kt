@@ -261,6 +261,8 @@ class PlantViewModel : ViewModel() {
                 blowdownValveOpen = plant.blowdownValveOpen,
                 lubricationPercent = status.lubricationPercent,
                 boilerScalePercent = status.boilerScalePercent,
+                throttleMaxValveAreaM2 = plant.piston.maxValveAreaM2,
+                feedwaterMaxFlowKgPerS = plant.boiler.feedwaterMaxFlowKgPerS,
             ),
         )
     }

@@ -56,6 +56,19 @@ data class PistonAssembly(val level: Int) {
      * with real thermal expansion as it heats up.
      */
     val pistonMassKg: Double get() = PhysicsConstants.STEEL_DENSITY_KG_PER_M3 * pistonAreaM2 * (2.0 * boreRadiusM)
+
+    /**
+     * Real natural-convection heat loss from the cylinder's own metal wall to the
+     * surrounding air - a real cylinder, lagged or not, still loses (or, if it's ever
+     * colder than ambient, gains) some heat this way; lagging/insulation reduces this
+     * real loss, it doesn't eliminate it, which is why real engines still show real
+     * cylinder condensation losses even when insulated. The barrel's real external
+     * surface area (2*pi*r*L, the same bore radius and stroke every other piston
+     * property already uses) times a standard textbook natural-convection coefficient
+     * for a metal surface in still air (a commonly cited 5-25 W/m^2K range; 15 is the
+     * midpoint) - not a chosen number to hit a target temperature.
+     */
+    val insulationLossWPerK: Double get() = 15.0 * (2.0 * PI * boreRadiusM * strokeLengthM)
 }
 
 /**
