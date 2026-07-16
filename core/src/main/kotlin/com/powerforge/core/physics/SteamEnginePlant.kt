@@ -5,6 +5,7 @@ import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.sin
 
 /**
@@ -202,8 +203,18 @@ class SteamEnginePlant(
     private val blowdownDescalePercentPerSecond = 3.0
     private val bearingSeizeThresholdSeconds = 90.0
     private val dryFireGraceSeconds = 0.5
-    private val boilerRuptureMargin = 1.5
     private val emergencyBrakeTorqueNm = 40.0
+
+    /**
+     * The real ratio between what the shell actually bursts at and what it's rated to
+     * hold: [PhysicsConstants.BOILER_DESIGN_SAFETY_FACTOR] is the real margin design
+     * pressure is set below yield stress by, and ultimate tensile strength is itself a
+     * real, higher stress than yield - shells don't tear the instant they permanently
+     * deform. Multiplying the two gives the true pressure ratio between rated and
+     * actually-bursts, derived entirely from real material constants.
+     */
+    private val boilerRuptureMargin = PhysicsConstants.BOILER_DESIGN_SAFETY_FACTOR *
+        (PhysicsConstants.STEEL_ULTIMATE_TENSILE_STRENGTH_PA / PhysicsConstants.STEEL_YIELD_STRENGTH_PA)
 
     private enum class CylinderPhase { ADMISSION, EXPANSION, EXHAUST }
 
@@ -221,9 +232,6 @@ class SteamEnginePlant(
         const val BREAKER_LATENCY_SECONDS = 0.15
         const val DRAIN_COCKS_LATENCY_SECONDS = 0.3
         const val BLOWDOWN_LATENCY_SECONDS = 0.3
-
-        /** Representative steam temperature used only to size the kinetic gas's particle scaling. */
-        const val NOMINAL_STEAM_TEMPERATURE_K = 420.0
     }
 
     fun rotatingAssemblyMassKg(): Double = flywheel.massKg + rotor.massKg + shaftMassKg
@@ -243,6 +251,41 @@ class SteamEnginePlant(
         return filmCoeff + (boundaryCoeff - filmCoeff) * exp(-omega / omegaTransition)
     }
 
+    /**
+     * Real aerodynamic drag on the flywheel spinning through the surrounding atmosphere -
+     * the standard turbulent free-rotating-disk torque correlation (Daily & Nece):
+     * Cm = 0.146 / Re^0.2, torque = 0.5*Cm*rho_air*omega^2*r^5. Vanishingly small at low
+     * RPM, genuinely significant at the tip speeds a large, fast flywheel can reach - a
+     * real fluid-dynamics effect, not a friction-model addition.
+     */
+    private fun windageDragTorqueNm(omega: Double): Double {
+        if (omega <= 1e-6) return 0.0
+        val r = flywheel.radiusM
+        val reynolds = max(1.0, omega * r * r / PhysicsConstants.AIR_KINEMATIC_VISCOSITY_M2_PER_S)
+        val torqueCoefficient = 0.146 / reynolds.pow(0.2)
+        return 0.5 * torqueCoefficient * PhysicsConstants.AIR_DENSITY_KG_PER_M3 * omega * omega * r.pow(5)
+    }
+
+    /**
+     * Real electromagnetic core losses in the rotor's iron - eddy currents and magnetic
+     * hysteresis, both present purely from spinning in an excited field, independent of
+     * whether any load current is actually being drawn (that's what makes this distinct
+     * from the Lenz's-law braking torque the load circuit produces). Steinmetz-equation
+     * loss physics: hysteresis loss is proportional to flux density^1.6 and frequency
+     * (so its reaction TORQUE is speed-independent - a real, textbook property of
+     * hysteresis loss); eddy current loss is proportional to flux density^2 and
+     * frequency^2 (so its torque grows linearly with speed).
+     */
+    private fun coreLossDragTorqueNm(omega: Double): Double {
+        val fluxDensityT = PhysicsConstants.RATED_MAGNETIC_FLUX_DENSITY_T * effectiveExcitationFraction
+        val electricalFrequencyPerRad = 1.0 / (2.0 * PI)
+        val hysteresisTorqueNm = PhysicsConstants.STEINMETZ_HYSTERESIS_COEFF *
+            fluxDensityT.pow(PhysicsConstants.STEINMETZ_HYSTERESIS_EXPONENT) * rotor.massKg * electricalFrequencyPerRad
+        val eddyCurrentTorqueNm = PhysicsConstants.STEINMETZ_EDDY_CURRENT_COEFF *
+            fluxDensityT * fluxDensityT * rotor.massKg * omega * electricalFrequencyPerRad * electricalFrequencyPerRad
+        return hysteresisTorqueNm + eddyCurrentTorqueNm
+    }
+
     /** Combustion is most efficient near a well-tuned air:fuel ratio; too little or too much air both waste heat. */
     private fun combustionEfficiencyFactor(airDamper: Double): Double {
         val optimal = 0.65
@@ -251,12 +294,26 @@ class SteamEnginePlant(
         return (1.0 - 0.4 * deviation * deviation).coerceIn(0.3, 1.0)
     }
 
+    /**
+     * The piston crown and cylinder head are real steel expanding by real linear thermal
+     * expansion as they heat up in service - volume scales as length cubed, so to first
+     * order a real solid's volume grows by 3*(alpha*deltaT), closing up a little of the
+     * clearance (dead) space at TDC. [boilerTemperatureK] stands in for the metal's own
+     * temperature (it's driven by the same steam that's heating the metal), a reasonable
+     * proxy given there's no separate metal thermal mass tracked.
+     */
+    private fun thermallyExpandedClearanceVolumeM3(): Double {
+        val deltaT = boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K
+        val volumetricExpansion = 3.0 * PhysicsConstants.STEEL_LINEAR_EXPANSION_COEFF_PER_K * deltaT
+        return piston.clearanceVolumeM3 * (1.0 - volumetricExpansion)
+    }
+
     /** Cylinder volume at crank angle [theta] via slider-crank kinematics (0 = TDC). */
     private fun cylinderVolumeM3(theta: Double): Double {
         val r = piston.crankRadiusM
         val l = piston.connectingRodLengthM
         val displacementM = r * (1.0 - cos(theta)) + (r * r / (4.0 * l)) * (1.0 - cos(2.0 * theta))
-        return piston.clearanceVolumeM3 + piston.pistonAreaM2 * displacementM
+        return thermallyExpandedClearanceVolumeM3() + piston.pistonAreaM2 * displacementM
     }
 
     /**
@@ -364,12 +421,17 @@ class SteamEnginePlant(
                 // pressure - a live estimate would lock the particle scaling factor in
                 // small during a cold start's low-density transient, and once the particle
                 // budget filled up on that stale small charge it could never widen again
-                // even after the boiler reached full pressure.
+                // even after the boiler reached full pressure. The reference temperature
+                // paired with that pressure is the real saturation temperature AT that
+                // pressure (the same Clausius-Clapeyron relation used for the boiler's own
+                // pressure everywhere else) - not an assumed number.
+                val referenceTemperatureK = saturationTemperatureK(boiler.maxPressurePa)
                 val fullChamberMassEstimateKg = (piston.clearanceVolumeM3 + piston.sweptVolumeM3) *
-                    steamDensityKgPerM3(boiler.maxPressurePa, NOMINAL_STEAM_TEMPERATURE_K)
+                    steamDensityKgPerM3(boiler.maxPressurePa, referenceTemperatureK)
                 cylinderPressurePa = kineticGas.substep(
                     massFlowInKgPerS = flow,
                     sourceTemperatureK = boilerTemperatureK,
+                    sourceDensityKgPerM3 = steamDensityKgPerM3(boilerPressurePa, boilerTemperatureK),
                     fullChamberMassEstimateKg = fullChamberMassEstimateKg,
                     pistonPositionM = volume / piston.pistonAreaM2,
                     pistonVelocityMPerS = pistonVelocityMPerS,
@@ -392,11 +454,32 @@ class SteamEnginePlant(
         // if left open once the engine is actually running.
         val drainCocksLossFactor = if (drainCocksSwitch.effective) 0.45 else 1.0
 
+        // The far side of the piston is always open to the atmosphere (or to whatever
+        // exhaust backpressure the previous stroke left, approximated here as
+        // atmospheric) - so it's a real force on every stroke, not just a reference
+        // level: when cylinderPressurePa is above atmospheric it's a net outward push,
+        // and when the trapped charge over-expands below atmospheric (past where the
+        // steam pressure alone would still be doing work) it's a genuine net INWARD pull
+        // - real vacuum drag, the atmosphere resisting the piston the same way it resists
+        // being over-expanded into on a real engine, not merely "less push."
+        val atmosphericAndVacuumForceN = (cylinderPressurePa - PhysicsConstants.ATMOSPHERIC_PRESSURE_PA) * piston.pistonAreaM2
+
         // Both halves push the crank the same rotational direction (that's the point of
         // double-acting), so the crank-effort kinematics are evaluated on localTheta, not
         // the full angle - otherwise the second half would wrongly compute as reverse torque.
-        val netForceN = (cylinderPressurePa - PhysicsConstants.ATMOSPHERIC_PRESSURE_PA) * piston.pistonAreaM2 * drainCocksLossFactor
+        val netForceN = atmosphericAndVacuumForceN * drainCocksLossFactor
         val drivingTorqueNm = netForceN * (r * sin(localTheta) + (r * r / (2.0 * l)) * sin(2.0 * localTheta))
+
+        // Gravity acting on the piston's real reciprocating mass, converted to crank
+        // torque via the same virtual-work kinematics (dx/dtheta) as the steam force -
+        // but using the FULL crank angle, not localTheta: unlike the double-acting steam
+        // force, gravity doesn't reset every half-stroke, it's the same constant downward
+        // pull through the whole revolution. Assumes a vertical cylinder with TDC at the
+        // top (the most common compact stationary-engine layout) - real weight, real
+        // stroke, a genuine periodic assist-then-resist torque every revolution, the same
+        // effect a real crank has to be balanced against.
+        val fullThetaBracket = r * sin(theta) + (r * r / (2.0 * l)) * sin(2.0 * theta)
+        val gravityTorqueNm = piston.pistonMassKg * PhysicsConstants.GRAVITY_M_PER_S2 * fullThetaBracket
 
         val muCoulombAtRest = coulombFrictionCoefficient(0.0)
         val normalForceN = rotatingAssemblyMassKg() * PhysicsConstants.GRAVITY_M_PER_S2
@@ -408,7 +491,7 @@ class SteamEnginePlant(
         var omega = angularVelocityRadPerS
         omega = when {
             overloaded -> 0.0
-            omega <= 1e-6 && drivingTorqueNm <= staticFrictionTorqueNm -> 0.0
+            omega <= 1e-6 && drivingTorqueNm + gravityTorqueNm <= staticFrictionTorqueNm -> 0.0
             else -> {
                 val muCoulomb = coulombFrictionCoefficient(omega)
                 val kineticFrictionTorqueNm = muCoulomb * normalForceN * frame.bearingRadiusM
@@ -417,6 +500,19 @@ class SteamEnginePlant(
                     frame.viscousFrictionCoeffNmSPerRad * (2.0 - lubeQuality) * omega
                 val brakeTorqueNm = if (emergencyBrakeSwitch.effective) emergencyBrakeTorqueNm else 0.0
 
+                // Windage: real aerodynamic drag on the flywheel spinning through the
+                // surrounding atmosphere, from the standard turbulent free-rotating-disk
+                // torque correlation (Cm = 0.146/Re^0.2, Daily & Nece) - not a friction
+                // fudge, a real fluid-dynamics formula using real air density/viscosity.
+                val windageTorqueNm = windageDragTorqueNm(omega)
+
+                // Real electromagnetic core losses in the rotor's iron - eddy currents and
+                // magnetic hysteresis, both present purely from spinning in a field
+                // regardless of whether the breaker is closed or any load current flows
+                // (that's what makes them distinct from the Lenz's-law load braking
+                // below), using real Steinmetz-coefficient loss physics.
+                val coreLossTorqueNm = if (clutchSwitch.effective) coreLossDragTorqueNm(omega) else 0.0
+
                 val generatorLoadTorqueNm = if (currentFlows) {
                     val ke = rotor.backEmfConstantVSPerRad * effectiveExcitationFraction
                     ke * ke * omega / (rotor.internalResistanceOhm + effectiveLoadResistanceOhm)
@@ -424,8 +520,8 @@ class SteamEnginePlant(
                     0.0
                 }
 
-                val netTorqueNm = drivingTorqueNm - kineticFrictionTorqueNm - viscousFrictionTorqueNm -
-                    generatorLoadTorqueNm - brakeTorqueNm
+                val netTorqueNm = drivingTorqueNm + gravityTorqueNm - kineticFrictionTorqueNm - viscousFrictionTorqueNm -
+                    windageTorqueNm - coreLossTorqueNm - generatorLoadTorqueNm - brakeTorqueNm
                 val angularAccelerationRadPerS2 = netTorqueNm / totalMomentOfInertiaKgM2()
                 max(0.0, omega + angularAccelerationRadPerS2 * dt)
             }
@@ -528,14 +624,24 @@ class SteamEnginePlant(
         checkForDamage(rawSaturationPa, omega)
     }
 
-    private fun checkForDamage(rawBoilerSaturationPa: Double, omega: Double) {
+    /**
+     * Real centrifugal hoop stress in the spinning rim, the textbook formula for a thin
+     * rotating ring: sigma = rho * v_tip^2. Cast iron's real tensile strength is what
+     * actually determines the burst speed, not a per-level number - a bigger rim at the
+     * same tip speed carries the exact same stress regardless of level.
+     */
+    private fun flywheelHoopStressPa(omega: Double): Double {
         val tipSpeedMPerS = omega * flywheel.radiusM
+        return PhysicsConstants.CAST_IRON_DENSITY_KG_PER_M3 * tipSpeedMPerS * tipSpeedMPerS
+    }
+
+    private fun checkForDamage(rawBoilerSaturationPa: Double, omega: Double) {
         when {
             secondsDryFiring > dryFireGraceSeconds ->
                 triggerDamage(FailureReason.BOILER_DRY_FIRE)
             rawBoilerSaturationPa > boiler.maxPressurePa * boilerRuptureMargin ->
                 triggerDamage(FailureReason.BOILER_RUPTURED)
-            tipSpeedMPerS > flywheel.maxSafeTipSpeedMPerS ->
+            flywheelHoopStressPa(omega) > PhysicsConstants.CAST_IRON_TENSILE_STRENGTH_PA ->
                 triggerDamage(FailureReason.FLYWHEEL_BURST)
             rotorWindingTemperatureK > rotor.maxWindingTemperatureK ->
                 triggerDamage(FailureReason.ROTOR_BURNOUT)

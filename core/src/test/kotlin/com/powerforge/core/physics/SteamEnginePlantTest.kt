@@ -228,9 +228,14 @@ class SteamEnginePlantTest {
 
     @Test
     fun `disengaging the clutch with the boiler wide open can overspeed and burst the flywheel`() {
+        // A big enough boiler paired with a piston that can actually keep up with it (or
+        // the boiler ruptures itself first, a different real failure mode) - and real
+        // windage drag now genuinely caps a free-spinning flywheel's speed, so the boiler
+        // has to be strong enough to push past that cap and up into real burst-speed
+        // centrifugal stress territory.
         val plant = SteamEnginePlant(
-            boiler = Boiler(8),
-            piston = PistonAssembly(1),
+            boiler = Boiler(14),
+            piston = PistonAssembly(3),
             flywheel = Flywheel(1),
         ).apply { clutchEngaged = false }
         val status = runMaintained(plant, totalSeconds = 3000.0)

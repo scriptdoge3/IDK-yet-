@@ -42,18 +42,34 @@ data class PistonAssembly(val level: Int) {
 
     /** Connecting rod length; a 4:1 rod/crank ratio is typical of real reciprocating engines. */
     val connectingRodLengthM: Double get() = crankRadiusM * 4.0
+
+    /**
+     * A solid steel cylinder roughly one bore-diameter long is a standard real
+     * proportion for a piston (real piston length-to-bore ratios cluster close to
+     * 1:1 for this class of engine) - so its mass is just real steel density times
+     * that real geometry, not a chosen number. This is the reciprocating mass gravity
+     * acts on every revolution, and what the piston/cylinder metal itself expands by
+     * with real thermal expansion as it heats up.
+     */
+    val pistonMassKg: Double get() = PhysicsConstants.STEEL_DENSITY_KG_PER_M3 * pistonAreaM2 * (2.0 * boreRadiusM)
 }
 
-/** Smooths torque delivery, but adds rotating mass and inertia to the shaft. */
+/**
+ * Smooths torque delivery, but adds rotating mass and inertia to the shaft. Cast iron,
+ * the traditional real material for flywheels - [PhysicsConstants.CAST_IRON_DENSITY_KG_PER_M3]
+ * and [PhysicsConstants.CAST_IRON_TENSILE_STRENGTH_PA] are what actually determine how
+ * fast it can spin before it bursts (see [SteamEnginePlant]'s damage check), not a
+ * separate per-level number: a bigger rim at the same tip speed carries the same real
+ * hoop stress, so the only thing raising the practical burst RPM at higher levels is the
+ * player choosing to spin it less, or upgrading the Frame so a smaller flywheel can carry
+ * the same rotating mass.
+ */
 data class Flywheel(val level: Int) {
     val massKg: Double = 2.2 + (level - 1) * 0.42
     val radiusM: Double = 0.095 + (level - 1) * 0.014
 
     /** Solid disk: I = 1/2 m r^2. */
     val momentOfInertiaKgM2: Double get() = 0.5 * massKg * radiusM * radiusM
-
-    /** Better rim materials/manufacturing at higher levels raise the safe tip speed before it bursts. */
-    val maxSafeTipSpeedMPerS: Double = 20.0 + (level - 1) * 4.0
 }
 
 /** DC generator equivalent circuit: EMF = ke*omega, current limited by internal + load resistance. */
