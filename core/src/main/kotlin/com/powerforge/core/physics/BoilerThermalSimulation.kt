@@ -45,7 +45,7 @@ import kotlin.random.Random
  * surface actually loses energy to a colder surface, rather than being a purely
  * bulk temperature adjustment.
  */
-class BoilerThermalSimulation(private val maxParticles: Int = 90, private val targetWaterParticleCount: Int = 55) {
+class BoilerThermalSimulation(private val maxParticles: Int = 220, private val targetWaterParticleCount: Int = 160) {
 
     companion object {
         private const val BOLTZMANN_J_PER_K = KineticCylinderGas.BOLTZMANN_J_PER_K
@@ -57,8 +57,14 @@ class BoilerThermalSimulation(private val maxParticles: Int = 90, private val ta
         /** A representative reservoir volume for sizing collision rates - real order of magnitude for a small boiler's water+steam space. */
         private const val RESERVOIR_VOLUME_M3 = 0.01
 
-        /** How many real flame-gas particles we aim to inject per simulated second, which together with the real flame power determines their real Fn scaling. */
-        private const val TARGET_FLAME_INJECTIONS_PER_SECOND = 40.0
+        /**
+         * How many real flame-gas particles we aim to inject per simulated second, which
+         * together with the real flame power determines their real Fn scaling - a higher
+         * count here is a purely a numerical-resolution choice (smaller, more numerous
+         * representative particles), trading computation for less visible sampling noise,
+         * same as [targetWaterParticleCount].
+         */
+        private const val TARGET_FLAME_INJECTIONS_PER_SECOND = 80.0
     }
 
     private val vx = DoubleArray(maxParticles)

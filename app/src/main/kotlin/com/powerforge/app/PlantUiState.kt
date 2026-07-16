@@ -1,6 +1,8 @@
 package com.powerforge.app
 
 import com.powerforge.core.physics.FailureReason
+import com.powerforge.core.physics.GasParticleView
+import com.powerforge.core.physics.LatticePointView
 import com.powerforge.core.physics.PartKind
 
 data class PartUiState(
@@ -63,6 +65,9 @@ data class PlantUiState(
     val flywheelStressFraction: Double = 0.0,
     val boilerStressFraction: Double = 0.0,
     val windingStressFraction: Double = 0.0,
+    val flywheelRadiusM: Double = 0.095,
+    val cylinderParticles: List<GasParticleView> = emptyList(),
+    val flywheelLatticePoints: List<LatticePointView> = emptyList(),
     val isDamaged: Boolean = false,
     val repairCostCredits: Long = 0,
     val failureReason: FailureReason = FailureReason.NONE,

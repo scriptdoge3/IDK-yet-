@@ -145,15 +145,37 @@ class SteamEnginePlantTest {
     }
 
     @Test
-    fun `shortening cutoff trades peak power for less steam per revolution`() {
-        val longCutoff = runningReferencePlant().apply { cutoffFraction = 0.9 }
+    fun `an excessively long cutoff can starve the boiler and cost net power`() {
+        // Real cutoff/expansive-working valve gear exists for exactly this reason:
+        // admitting fresh steam for almost the whole stroke can draw a real boiler's
+        // pressure down faster than the firebox can keep up, so the boiler never
+        // reaches its own rated pressure and every stroke pushes with less real force
+        // than a shorter admission window - one that lets the boiler recover pressure
+        // between strokes - actually delivers. A real operator wouldn't crank the
+        // cutoff to an extreme before the engine has even self-started, so both plants
+        // warm up under the default cutoff first.
+        val longCutoff = runningReferencePlant()
+        runToSteadyState(longCutoff)
+        longCutoff.cutoffFraction = 0.9
         val longStatus = runToSteadyState(longCutoff)
 
-        val shortCutoff = runningReferencePlant().apply { cutoffFraction = 0.2 }
+        val shortCutoff = runningReferencePlant()
+        runToSteadyState(shortCutoff)
+        shortCutoff.cutoffFraction = 0.2
         val shortStatus = runToSteadyState(shortCutoff)
 
-        println("longCutoff=${longStatus.electricalPowerW}W shortCutoff=${shortStatus.electricalPowerW}W")
-        assertTrue(shortStatus.electricalPowerW < longStatus.electricalPowerW)
+        println(
+            "longCutoff=${longStatus.electricalPowerW}W boilerP=${longStatus.boilerPressurePa}Pa; " +
+                "shortCutoff=${shortStatus.electricalPowerW}W boilerP=${shortStatus.boilerPressurePa}Pa"
+        )
+        assertTrue(
+            "a boiler-starved long cutoff should deliver less net power than a shorter one that lets it recover",
+            longStatus.electricalPowerW < shortStatus.electricalPowerW,
+        )
+        assertTrue(
+            "the starved long-cutoff boiler should be running well below its own rated pressure",
+            longStatus.boilerPressurePa < shortStatus.boilerPressurePa,
+        )
     }
 
     @Test

@@ -31,6 +31,8 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.unit.dp
+import com.powerforge.core.physics.GasParticleView
+import com.powerforge.core.physics.LatticePointView
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -54,6 +56,17 @@ enum class EngineVisualMode {
  * A part with no real modeled failure/thermal quantity (the piston/rod in stress mode, the
  * flywheel in thermal mode - cast iron's temperature isn't tracked, there's no real physics
  * backing a number there) is drawn neutral rather than inventing one.
+ *
+ * The cylinder and the flywheel rim are drawn as their actual real particles/lattice
+ * points, not a stylized fill or a perfect circle - [cylinderParticles] is exactly what
+ * [com.powerforge.core.physics.KineticCylinderGas.particleSnapshot] just resolved (real
+ * position, real speed, per particle), and [flywheelLatticePoints] is exactly what
+ * [com.powerforge.core.physics.FlywheelLattice.pointSnapshot] just resolved (real position,
+ * real bond state, per rim point). The boiler is deliberately NOT drawn this way: its water
+ * is simulated as a well-mixed reservoir (real energy/velocity state, but no tracked
+ * position - see BoilerThermalSimulation's own docs for why that's the physically
+ * appropriate model for a convectively-mixed liquid), so there is no real per-particle
+ * position to plot there without inventing one.
  */
 @Composable
 fun EngineVisual(
@@ -62,10 +75,13 @@ fun EngineVisual(
     crankAngleRadProvider: () -> Double,
     cylinderPressurePa: Double,
     cylinderTemperatureK: Double,
+    cylinderParticles: List<GasParticleView>,
     boilerTemperatureK: Double,
     boilerWaterLevelFraction: Double,
     boilerStressFraction: Double,
     flywheelStressFraction: Double,
+    flywheelLatticePoints: List<LatticePointView>,
+    flywheelRadiusM: Double,
     windingStressFraction: Double,
     rotorWindingTemperatureK: Double,
     flameActive: Boolean,
@@ -169,6 +185,8 @@ fun EngineVisual(
             cylinderTop = cylinderTop,
             cylinderHeight = cylinderHeight,
             theta = theta,
+            particles = cylinderParticles,
+            mode = mode,
             fillColor = when (mode) {
                 EngineVisualMode.NORMAL -> pressureToColor(cylinderPressurePa)
                 EngineVisualMode.THERMAL -> thermalColor(cylinderTemperatureK)
@@ -196,6 +214,8 @@ fun EngineVisual(
             radius = flywheelRadius,
             theta = theta,
             crankPin = crankPin,
+            latticePoints = flywheelLatticePoints,
+            restRadiusM = flywheelRadiusM,
             rimColor = when (mode) {
                 EngineVisualMode.NORMAL -> if (isFailing) palette.errorColor else palette.primaryColor
                 // Cast iron's temperature isn't a real tracked quantity in this
@@ -369,6 +389,8 @@ private fun DrawScope.drawCylinderAndPiston(
     cylinderTop: Float,
     cylinderHeight: Float,
     theta: Double,
+    particles: List<GasParticleView>,
+    mode: EngineVisualMode,
     fillColor: Color,
     palette: EnginePalette,
 ): Float {
@@ -399,12 +421,33 @@ private fun DrawScope.drawCylinderAndPiston(
         size = Size(cylinderRight - cylinderLeft, cylinderHeight),
         cornerRadius = CornerRadius(cylinderHeight * 0.25f),
     )
+    // The real working chamber is between the fixed valve wall (cylinderLeft, where the
+    // steam pipe enters - real position x=0 in KineticCylinderGas) and the piston's
+    // current face, not the far side of the cylinder: that's exactly the real particles'
+    // own axial range, so the fill and the dots share the same region deliberately.
+    val chamberLeft = cylinderLeft + 4f
+    val chamberRight = pistonCenterX
+    val chamberTop = cylinderTop + 4f
+    val chamberBottom = cylinderTop + cylinderHeight - 4f
     drawRoundRect(
-        color = fillColor,
-        topLeft = Offset(pistonCenterX, cylinderTop + 4f),
-        size = Size((cylinderRight - pistonCenterX).coerceAtLeast(0f), cylinderHeight - 8f),
+        color = fillColor.copy(alpha = fillColor.alpha * 0.4f),
+        topLeft = Offset(chamberLeft, chamberTop),
+        size = Size((chamberRight - chamberLeft).coerceAtLeast(0f), chamberBottom - chamberTop),
         cornerRadius = CornerRadius(cylinderHeight * 0.2f),
     )
+    // Every real particle currently representing the trapped charge, at its actual
+    // position and colored by its actual speed - not a synthesized scatter.
+    val dotColor = if (mode == EngineVisualMode.STRESS) palette.stressBase else null
+    for (particle in particles) {
+        val px = chamberLeft + particle.axialFraction.toFloat() * (chamberRight - chamberLeft).coerceAtLeast(0f)
+        val py = (chamberTop + chamberBottom) / 2f + particle.lateralFraction.toFloat() * (chamberBottom - chamberTop) / 2f
+        val color = dotColor ?: lerp(
+            Color(0xFFAFC6E8),
+            Color(0xFFFFF3D6),
+            (particle.speedMPerS / 900.0).coerceIn(0.0, 1.0).toFloat(),
+        )
+        drawCircle(color = color, radius = 1.6f, center = Offset(px, py))
+    }
     drawRoundRect(
         color = palette.neutralMetal,
         topLeft = Offset(cylinderLeft, cylinderTop),
@@ -467,13 +510,12 @@ private fun DrawScope.drawFlywheel(
     radius: Float,
     theta: Double,
     crankPin: Offset,
+    latticePoints: List<LatticePointView>,
+    restRadiusM: Double,
     rimColor: Color,
     palette: EnginePalette,
 ) {
-    // Outer shadow ring for depth, then the real colored rim on top
-    drawCircle(color = palette.housingColor, radius = radius + 3f, center = center, style = Stroke(width = 4f))
-    drawCircle(color = rimColor, radius = radius, center = center, style = Stroke(width = 11f))
-
+    // Hub and spokes underneath, decorative structure (the physics only models the rim)
     val spokeCount = 6
     repeat(spokeCount) { i ->
         val spokeAngle = (2 * PI / spokeCount) * i + theta
@@ -484,6 +526,33 @@ private fun DrawScope.drawFlywheel(
         // Tapered look: a wide stroke near the hub, thin highlight line for depth
         drawLine(color = palette.spokeColor, start = center, end = end, strokeWidth = 6f, cap = StrokeCap.Round)
         drawLine(color = palette.neutralMetal, start = center, end = end, strokeWidth = 1.5f)
+    }
+
+    // The rim itself: every real lattice point at its actual current position (scaled
+    // from real meters against the rim's real rest radius), connected to its actual
+    // neighbor by a line only where that real spring bond is still intact - not a
+    // perfect decorative circle. At safe operating speed the real elastic strain is
+    // tiny, so this traces a circle indistinguishable from rest to the eye; once a bond
+    // has genuinely snapped this instead shows wherever the real unrestrained points
+    // actually are.
+    val pixelsPerMeter = if (restRadiusM > 1e-9) radius / restRadiusM.toFloat() else 0f
+    if (latticePoints.isNotEmpty()) {
+        val pixelPoints = latticePoints.map { p ->
+            Offset(center.x + p.xM.toFloat() * pixelsPerMeter, center.y + p.yM.toFloat() * pixelsPerMeter)
+        }
+        for (i in latticePoints.indices) {
+            val next = (i + 1) % latticePoints.size
+            if (latticePoints[i].bondToNextIntact) {
+                drawLine(color = rimColor, start = pixelPoints[i], end = pixelPoints[next], strokeWidth = 5f, cap = StrokeCap.Round)
+            }
+        }
+        for (p in pixelPoints) {
+            drawCircle(color = rimColor, radius = 3f, center = p)
+        }
+    } else {
+        // Defensive fallback if a snapshot is ever unavailable - the real rim always
+        // has a rest shape close to this circle anyway.
+        drawCircle(color = rimColor, radius = radius, center = center, style = Stroke(width = 11f))
     }
 
     // Hub boss with bolt-hole ring

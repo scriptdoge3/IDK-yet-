@@ -6,6 +6,18 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
+ * One real rim point's state, for visualization - see [FlywheelLattice.pointSnapshot].
+ * [xM]/[yM] are the point's real current position relative to the hub (meters);
+ * [bondToNextIntact] is whether the real spring bond to the next point (index+1, wrapping)
+ * is still intact.
+ */
+data class LatticePointView(
+    val xM: Double,
+    val yM: Double,
+    val bondToNextIntact: Boolean,
+)
+
+/**
  * The flywheel rim as an actual discrete mass-spring ring, not a closed-form stress
  * formula. [pointCount] real point masses (their total equal to the flywheel's real
  * mass, their individual mass and spacing set by the flywheel's real radius and cast
@@ -55,6 +67,10 @@ class FlywheelLattice(private val pointCount: Int = 24) {
     private var dampingNsPerM = 0.0
     private var configuredForLevel = -1
 
+    /** The rim's real undeformed radius, for a visualization to scale real point positions against. */
+    var restRadiusM: Double = 0.0
+        private set
+
     var isIntact: Boolean = true
         private set
 
@@ -70,12 +86,23 @@ class FlywheelLattice(private val pointCount: Int = 24) {
     val stressFraction: Double
         get() = if (maxBondTensionN > 1e-9) (peakBondTensionN / maxBondTensionN) else 0.0
 
+    /**
+     * Every real rim point's current position and bond state, as [step] just left it -
+     * not synthesized. Under normal load this traces a circle indistinguishable from
+     * [restRadiusM] to the eye (real elastic strain at safe operating speed is tiny);
+     * once a bond has genuinely snapped, this keeps reading out wherever the real
+     * unrestrained points actually flew to under pure centrifugal force, since a burst
+     * lattice is not reset back to its rest shape.
+     */
+    fun pointSnapshot(): List<LatticePointView> =
+        (0 until pointCount).map { i -> LatticePointView(x[i], y[i], bondIntact[i]) }
+
     fun configure(flywheel: Flywheel) {
         if (configuredForLevel == flywheel.level) return
         configuredForLevel = flywheel.level
 
         pointMassKg = flywheel.massKg / pointCount
-        val restRadiusM = flywheel.radiusM
+        restRadiusM = flywheel.radiusM
         naturalSegmentLengthM = 2.0 * restRadiusM * sin(PI / pointCount)
 
         // Real cross-section implied by the rim's real total mass, real density, and

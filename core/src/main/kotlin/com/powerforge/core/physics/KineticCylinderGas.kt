@@ -9,6 +9,15 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 /**
+ * One real cylinder-gas particle's state, for visualization - see [KineticCylinderGas.particleSnapshot].
+ */
+data class GasParticleView(
+    val axialFraction: Double,
+    val lateralFraction: Double,
+    val speedMPerS: Double,
+)
+
+/**
  * A representative-particle (DSMC-style) simulation of the steam trapped on one
  * face of the cylinder. Literally tracking every real molecule is impossible - a
  * charge of steam this size is on the order of 10^20-10^21 real molecules - so each
@@ -37,7 +46,7 @@ import kotlin.random.Random
  * that governs real molecular collision rates, not an approximation of the physics
  * itself. See [collideParticles].
  */
-class KineticCylinderGas(private val maxParticles: Int = 70) {
+class KineticCylinderGas(private val maxParticles: Int = 200) {
 
     companion object {
         /** Real mass of one H2O molecule: 18.015 g/mol / Avogadro's number. */
@@ -52,11 +61,13 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
          * it), only how much statistical noise is visible and how expensive each substep
          * is, the same tradeoff as choosing a grid resolution in any other numerical
          * simulation. A real engine's gauges are far smoother than this because a real
-         * chamber holds ~10^20 molecules, not a few dozen; the jitter that count leaves
+         * chamber holds ~10^20 molecules, not a few hundred; the jitter that count leaves
          * visible here is real sampling noise from a genuinely smaller ensemble, not an
-         * invented effect.
+         * invented effect - a higher count here trades computation for a smaller, more
+         * realistic-looking sampling error (noise falls off as 1/sqrt(N)), the same
+         * resolution-vs-cost tradeoff as any other particle simulation.
          */
-        const val TARGET_PARTICLE_COUNT = 55.0
+        const val TARGET_PARTICLE_COUNT = 160.0
 
         /**
          * A safety bound on the analytic per-particle ballistic solver, not a physics
@@ -119,6 +130,33 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
 
     val particleCount: Int get() = activeCount
 
+    // The chamber's real current extent, recorded each substep purely so a snapshot
+    // consumer (see [particleSnapshot]) can normalize each particle's real position
+    // into a fraction without needing to be passed the geometry separately.
+    private var lastChamberLengthM = 1e-6
+    private var lastHalfWidthM = 1e-6
+
+    /**
+     * Every real particle currently representing the trapped charge, as it actually is
+     * right now - not a synthesized scatter. [GasParticleView.axialFraction] is the
+     * particle's real position along the chamber (0 at the fixed valve wall, 1 at the
+     * moving piston face), [GasParticleView.lateralFraction] its real position across
+     * the bore (-1..1), and [GasParticleView.speedMPerS] its real instantaneous speed -
+     * exactly the state [substep] just resolved by simulating real ballistic motion and
+     * elastic collisions, read out rather than recomputed.
+     */
+    fun particleSnapshot(): List<GasParticleView> {
+        val chamberLength = max(1e-9, lastChamberLengthM)
+        val halfWidth = max(1e-9, lastHalfWidthM)
+        return (0 until activeCount).map { i ->
+            GasParticleView(
+                axialFraction = (x[i] / chamberLength).coerceIn(0.0, 1.0),
+                lateralFraction = (y[i] / halfWidth).coerceIn(-1.0, 1.0),
+                speedMPerS = sqrt(vx[i] * vx[i] + vy[i] * vy[i]),
+            )
+        }
+    }
+
     /**
      * Empties the chamber - a fresh charge starts from nothing, exactly like real
      * admission after exhaust. Pressure resets to atmospheric, not vacuum: the
@@ -126,8 +164,7 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
      * follows, not evacuated. Starting the readout at 0 Pa would make the very next
      * valve-flow calculation see a fake near-vacuum downstream and briefly choke in
      * an artificial pressure spike that has nothing to do with the real boiler state.
-     */
-    /**
+     *
      * A repaired/restarted engine is meant to behave exactly like a freshly built one -
      * a real cold restart has no memory of the previous run, and neither should the
      * random sampling that stands in for real molecular chaos. Re-seeding here (not
@@ -182,6 +219,8 @@ class KineticCylinderGas(private val maxParticles: Int = 70) {
         pistonAreaM2: Double,
         dt: Double,
     ): Double {
+        lastChamberLengthM = pistonPositionM
+        lastHalfWidthM = halfWidthM
         val particleMassKg = max(
             WATER_MOLECULE_MASS_KG,
             fullChamberMassEstimateKg / TARGET_PARTICLE_COUNT,

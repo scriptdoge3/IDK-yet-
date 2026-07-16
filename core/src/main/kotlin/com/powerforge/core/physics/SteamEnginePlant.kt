@@ -710,6 +710,12 @@ class SteamEnginePlant(
         return current * current * effectiveLoadResistanceOhm
     }
 
+    /** Every real cylinder-gas particle right now, for visualization - see [KineticCylinderGas.particleSnapshot]. */
+    fun cylinderParticles(): List<GasParticleView> = kineticGas.particleSnapshot()
+
+    /** Every real flywheel-rim lattice point right now, for visualization - see [FlywheelLattice.pointSnapshot]. */
+    fun flywheelLatticePoints(): List<LatticePointView> = flywheelLattice.pointSnapshot()
+
     fun status(): PlantStatus {
         val failureReason = when {
             isDamaged -> damageReason
