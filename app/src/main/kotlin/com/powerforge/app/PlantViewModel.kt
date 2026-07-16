@@ -35,7 +35,10 @@ class PlantViewModel : ViewModel() {
         private const val REPAIR_COST_PER_LEVEL_CREDITS = 35L
     }
 
-    private val plant = SteamEnginePlant()
+    // A fresh session starts as a real plant actually does: cold, unlit, and
+    // stopped - the operator has to light the burner and bring it up to pressure
+    // themselves, not find it already running.
+    private val plant = SteamEnginePlant().apply { ignitionOn = false }
 
     private var credits: Double = 0.0
     private var researchPoints: Double = 0.0

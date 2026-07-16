@@ -28,7 +28,7 @@ data class ControlsUiState(
     val cutoffFraction: Double = 0.75,
     val fuelValveFraction: Double = 1.0,
     val airDamperFraction: Double = 0.65,
-    val ignitionOn: Boolean = true,
+    val ignitionOn: Boolean = false,
     val feedwaterValveFraction: Double = 1.0,
     val safetyValveOpen: Boolean = false,
     val excitationFraction: Double = 1.0,

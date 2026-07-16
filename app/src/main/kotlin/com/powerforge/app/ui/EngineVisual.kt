@@ -27,6 +27,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.unit.dp
@@ -42,10 +43,11 @@ enum class EngineVisualMode {
 }
 
 /**
- * The whole drivetrain in one connected drawing - boiler, cylinder/piston/crank, flywheel,
- * and generator, all on the one real shaft, driven by the same tracked [crankAngleRadProvider]
- * the physics itself advances. [mode] doesn't add any new physics, it just chooses which real
- * quantity already computed by the simulation each part's fill color reports: pressure/normal
+ * The whole drivetrain in one connected drawing - boiler (with firebox, chimney, and
+ * exhaust), cylinder/piston/crosshead/crank, flywheel, and generator, all mounted on one
+ * real shaft and baseplate, driven by the same tracked [crankAngleRadProvider] the physics
+ * itself advances. [mode] doesn't add any new physics, it just chooses which real quantity
+ * already computed by the simulation each part's fill color reports: pressure/normal
  * appearance, real temperatures (boiler water, cylinder steam, generator windings), or real
  * structural load fractions (flywheel rim tension vs. its real breaking tension, boiler
  * pressure vs. its real rupture pressure, winding temperature vs. its real rated maximum).
@@ -73,7 +75,7 @@ fun EngineVisual(
     modifier: Modifier = Modifier,
 ) {
     var displayAngleRad by remember { mutableFloatStateOf(0f) }
-    var flamePhase by remember { mutableFloatStateOf(0f) }
+    var animationPhase by remember { mutableFloatStateOf(0f) }
     val latestRpm = rememberUpdatedState(rpmProvider)
     val latestTrueAngle = rememberUpdatedState(crankAngleRadProvider)
 
@@ -97,22 +99,27 @@ fun EngineVisual(
 
             displayAngleRad = next % (2f * PI.toFloat())
             if (displayAngleRad < 0f) displayAngleRad += 2f * PI.toFloat()
-            flamePhase += dtSeconds.toFloat() * 5f
+            animationPhase += dtSeconds.toFloat()
         }
     }
 
-    val neutralMetal = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
-    val strongMetal = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
-    val spokeColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-    val primaryColor = MaterialTheme.colorScheme.primary
-    val errorColor = MaterialTheme.colorScheme.error
-    val stressBase = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
-    val housingColor = Color(0xFF15181C)
-    val waterColor = Color(0xFF3E7CB1)
-    val flameColor = Color(0xFFFFA23C)
+    val palette = EnginePalette(
+        neutralMetal = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+        strongMetal = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+        spokeColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+        primaryColor = MaterialTheme.colorScheme.primary,
+        errorColor = MaterialTheme.colorScheme.error,
+        stressBase = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f),
+        housingColor = Color(0xFF15181C),
+        waterColor = Color(0xFF3E7CB1),
+        flameColor = Color(0xFFFFA23C),
+        smokeColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.22f),
+    )
 
-    Canvas(modifier = modifier.fillMaxWidth().height(200.dp)) {
-        val midY = size.height * 0.56f
+    Canvas(modifier = modifier.fillMaxWidth().height(230.dp)) {
+        val theta = displayAngleRad.toDouble()
+        val midY = size.height * 0.60f
+        val baseY = size.height * 0.90f
 
         // --- Zone layout: boiler | cylinder+piston | flywheel | generator, left to right ---
         val boilerLeft = size.width * 0.02f
@@ -120,185 +127,439 @@ fun EngineVisual(
         val cylinderLeft = size.width * 0.31f
         val cylinderRight = size.width * 0.62f
         val flywheelCenter = Offset(size.width * 0.75f, midY)
-        val flywheelRadius = size.height * 0.30f
+        val flywheelRadius = size.height * 0.26f
         val crankPinRadius = flywheelRadius * 0.55f
         val generatorCenter = Offset(size.width * 0.93f, midY)
-        val generatorRadius = size.height * 0.20f
+        val generatorRadius = size.height * 0.175f
 
-        // === Boiler ===
-        val boilerTop = midY - size.height * 0.26f
-        val boilerHeight = size.height * 0.40f
-        val boilerShellColor = when (mode) {
-            EngineVisualMode.NORMAL -> neutralMetal
-            EngineVisualMode.THERMAL -> thermalColor(boilerTemperatureK)
-            EngineVisualMode.STRESS -> lerp(stressBase, errorColor, boilerStressFraction.coerceIn(0.0, 1.0).toFloat())
-        }
-        drawRoundRect(
-            color = housingColor,
-            topLeft = Offset(boilerLeft, boilerTop),
-            size = Size(boilerRight - boilerLeft, boilerHeight),
-            cornerRadius = CornerRadius(boilerHeight * 0.22f),
-        )
-        // Water fill, from the bottom, real level fraction
-        val waterFillHeight = (boilerHeight - 6f) * boilerWaterLevelFraction.toFloat()
-        drawRoundRect(
-            color = waterColor,
-            topLeft = Offset(boilerLeft + 3f, boilerTop + boilerHeight - 3f - waterFillHeight),
-            size = Size(boilerRight - boilerLeft - 6f, waterFillHeight),
-            cornerRadius = CornerRadius(boilerHeight * 0.16f),
-        )
-        drawRoundRect(
-            color = boilerShellColor,
-            topLeft = Offset(boilerLeft, boilerTop),
-            size = Size(boilerRight - boilerLeft, boilerHeight),
-            cornerRadius = CornerRadius(boilerHeight * 0.22f),
-            style = Stroke(width = 4f),
-        )
-        // Firebox flame, a real status cue (lit or not), gently flickering while lit
-        val fireboxCenterX = (boilerLeft + boilerRight) / 2f
-        val fireboxY = boilerTop + boilerHeight + size.height * 0.03f
-        if (flameActive) {
-            val flicker = 0.75f + 0.25f * kotlin.math.sin(flamePhase * 3f)
-            val flameHeight = size.height * 0.09f * flicker
-            drawCircle(
-                color = flameColor.copy(alpha = 0.35f * flicker),
-                radius = flameHeight * 1.4f,
-                center = Offset(fireboxCenterX, fireboxY),
-            )
-            drawCircle(
-                color = flameColor,
-                radius = flameHeight * 0.7f,
-                center = Offset(fireboxCenterX, fireboxY),
-            )
-        } else {
-            drawCircle(color = housingColor, radius = size.height * 0.05f, center = Offset(fireboxCenterX, fireboxY))
-        }
-        // Pipe from boiler to cylinder
-        drawLine(
-            color = strongMetal,
-            start = Offset(boilerRight, boilerTop + boilerHeight * 0.22f),
-            end = Offset(cylinderLeft, boilerTop + boilerHeight * 0.22f),
-            strokeWidth = 5f,
-        )
-        drawLine(
-            color = strongMetal,
-            start = Offset(cylinderLeft, boilerTop + boilerHeight * 0.22f),
-            end = Offset(cylinderLeft, midY - size.height * 0.14f),
-            strokeWidth = 5f,
+        drawBaseplate(baseY, size.width * 0.01f, size.width * 0.99f, palette)
+
+        val boilerTop = midY - size.height * 0.30f
+        val boilerHeight = size.height * 0.38f
+        drawBoiler(
+            left = boilerLeft,
+            right = boilerRight,
+            top = boilerTop,
+            heightPx = boilerHeight,
+            baseY = baseY,
+            waterLevelFraction = boilerWaterLevelFraction,
+            flameActive = flameActive,
+            animationPhase = animationPhase,
+            shellColor = when (mode) {
+                EngineVisualMode.NORMAL -> palette.neutralMetal
+                EngineVisualMode.THERMAL -> thermalColor(boilerTemperatureK)
+                EngineVisualMode.STRESS -> lerp(palette.stressBase, palette.errorColor, boilerStressFraction.coerceIn(0.0, 1.0).toFloat())
+            },
+            palette = palette,
         )
 
-        // === Cylinder + piston + connecting rod ===
         val cylinderTop = midY - size.height * 0.14f
         val cylinderHeight = size.height * 0.28f
-        val strokeVisualPx = cylinderRight - cylinderLeft - size.height * 0.18f
-
-        val theta = displayAngleRad.toDouble()
-        val crankRadiusRatio = 0.06 // r/L ratio for the visual slider-crank approximation
-        val displacementFraction =
-            0.5 * (1 - cos(theta)) + (crankRadiusRatio / 4.0) * (1 - cos(2 * theta))
-        val pistonCenterX = (cylinderLeft + size.height * 0.09f + displacementFraction * strokeVisualPx).toFloat()
-
-        val cylinderFillColor = when (mode) {
-            EngineVisualMode.NORMAL -> pressureToColor(cylinderPressurePa)
-            EngineVisualMode.THERMAL -> thermalColor(cylinderTemperatureK)
-            // No real strength-to-failure model exists for the piston/rod - shown neutral
-            // rather than fabricating a stress number nothing in the physics backs.
-            EngineVisualMode.STRESS -> stressBase
-        }
-
-        drawRoundRect(
-            color = housingColor,
-            topLeft = Offset(cylinderLeft, cylinderTop),
-            size = Size(cylinderRight - cylinderLeft, cylinderHeight),
-            cornerRadius = CornerRadius(cylinderHeight * 0.25f),
-        )
-        drawRoundRect(
-            color = cylinderFillColor,
-            topLeft = Offset(pistonCenterX, cylinderTop + 4f),
-            size = Size((cylinderRight - pistonCenterX).coerceAtLeast(0f), cylinderHeight - 8f),
-            cornerRadius = CornerRadius(cylinderHeight * 0.2f),
-        )
-        drawRoundRect(
-            color = neutralMetal,
-            topLeft = Offset(cylinderLeft, cylinderTop),
-            size = Size(cylinderRight - cylinderLeft, cylinderHeight),
-            cornerRadius = CornerRadius(cylinderHeight * 0.25f),
-            style = Stroke(width = 3f),
+        drawSteamPipe(
+            fromX = boilerRight,
+            toX = cylinderLeft,
+            atY = boilerTop + boilerHeight * 0.20f,
+            downToY = cylinderTop,
+            palette = palette,
         )
 
-        val pistonWidth = size.height * 0.06f
-        drawRect(
-            color = strongMetal,
-            topLeft = Offset(pistonCenterX - pistonWidth / 2f, cylinderTop - 3f),
-            size = Size(pistonWidth, cylinderHeight + 6f),
+        val pistonCenterX = drawCylinderAndPiston(
+            cylinderLeft = cylinderLeft,
+            cylinderRight = cylinderRight,
+            cylinderTop = cylinderTop,
+            cylinderHeight = cylinderHeight,
+            theta = theta,
+            fillColor = when (mode) {
+                EngineVisualMode.NORMAL -> pressureToColor(cylinderPressurePa)
+                EngineVisualMode.THERMAL -> thermalColor(cylinderTemperatureK)
+                // No real strength-to-failure model exists for the piston/rod - shown
+                // neutral rather than fabricating a stress number nothing in the physics
+                // backs.
+                EngineVisualMode.STRESS -> palette.stressBase
+            },
+            palette = palette,
         )
 
         val crankPin = Offset(
             flywheelCenter.x + (crankPinRadius * cos(theta)).toFloat(),
             flywheelCenter.y + (crankPinRadius * sin(theta)).toFloat(),
         )
-        drawLine(
-            color = strongMetal,
-            start = Offset(pistonCenterX, flywheelCenter.y),
-            end = crankPin,
-            strokeWidth = 4f,
-            cap = StrokeCap.Round,
+        drawCrossheadAndRod(
+            pistonCenterX = pistonCenterX,
+            railY = flywheelCenter.y,
+            crankPin = crankPin,
+            palette = palette,
         )
 
-        // === Flywheel ===
-        val flywheelRimColor = when (mode) {
-            EngineVisualMode.NORMAL -> if (isFailing) errorColor else primaryColor
-            // Cast iron's temperature isn't a real tracked quantity in this simulation -
-            // shown neutral rather than inventing one.
-            EngineVisualMode.THERMAL -> neutralMetal
-            EngineVisualMode.STRESS -> lerp(stressBase, errorColor, flywheelStressFraction.coerceIn(0.0, 1.0).toFloat())
-        }
-        drawCircle(color = flywheelRimColor, radius = flywheelRadius, center = flywheelCenter, style = Stroke(width = 11f))
-        val spokeCount = 6
-        repeat(spokeCount) { i ->
-            val spokeAngle = (2 * PI / spokeCount) * i + theta
-            val end = Offset(
-                flywheelCenter.x + (flywheelRadius * 0.9f * cos(spokeAngle)).toFloat(),
-                flywheelCenter.y + (flywheelRadius * 0.9f * sin(spokeAngle)).toFloat(),
-            )
-            drawLine(color = spokeColor, start = flywheelCenter, end = end, strokeWidth = 5f)
-        }
-        drawCircle(color = housingColor, radius = flywheelRadius * 0.18f, center = flywheelCenter)
-        drawCircle(color = strongMetal, radius = 6f, center = crankPin)
+        drawFlywheel(
+            center = flywheelCenter,
+            radius = flywheelRadius,
+            theta = theta,
+            crankPin = crankPin,
+            rimColor = when (mode) {
+                EngineVisualMode.NORMAL -> if (isFailing) palette.errorColor else palette.primaryColor
+                // Cast iron's temperature isn't a real tracked quantity in this
+                // simulation - shown neutral rather than inventing one.
+                EngineVisualMode.THERMAL -> palette.neutralMetal
+                EngineVisualMode.STRESS -> lerp(palette.stressBase, palette.errorColor, flywheelStressFraction.coerceIn(0.0, 1.0).toFloat())
+            },
+            palette = palette,
+        )
 
-        // Shaft coupling flywheel to generator
         drawLine(
-            color = strongMetal,
+            color = palette.strongMetal,
             start = Offset(flywheelCenter.x + flywheelRadius, flywheelCenter.y),
             end = Offset(generatorCenter.x - generatorRadius, generatorCenter.y),
             strokeWidth = 6f,
         )
 
-        // === Generator ===
-        val generatorColor = when (mode) {
-            EngineVisualMode.NORMAL -> neutralMetal
-            EngineVisualMode.THERMAL -> thermalColor(rotorWindingTemperatureK)
-            EngineVisualMode.STRESS -> lerp(stressBase, errorColor, windingStressFraction.coerceIn(0.0, 1.0).toFloat())
-        }
-        drawCircle(color = housingColor, radius = generatorRadius, center = generatorCenter)
-        drawCircle(color = generatorColor, radius = generatorRadius, center = generatorCenter, style = Stroke(width = 10f))
-        // Winding coil arcs on the drum face
-        repeat(4) { i ->
-            val angle = (2 * PI / 4) * i + theta * 2.0
-            val a = Offset(
-                generatorCenter.x + (generatorRadius * 0.55f * cos(angle)).toFloat(),
-                generatorCenter.y + (generatorRadius * 0.55f * sin(angle)).toFloat(),
-            )
-            drawCircle(color = spokeColor, radius = generatorRadius * 0.12f, center = a, style = Stroke(width = 3f))
-        }
-        // Brush spark: lit only while current is actually flowing to a real load
-        val currentFlowing = generatorEngaged && electricalPowerW > 1e-6
-        drawCircle(
-            color = if (currentFlowing) Color(0xFFFFE9A6) else housingColor,
-            radius = generatorRadius * 0.22f,
+        drawGenerator(
             center = generatorCenter,
+            radius = generatorRadius,
+            theta = theta,
+            baseY = baseY,
+            currentFlowing = generatorEngaged && electricalPowerW > 1e-6,
+            drumColor = when (mode) {
+                EngineVisualMode.NORMAL -> palette.neutralMetal
+                EngineVisualMode.THERMAL -> thermalColor(rotorWindingTemperatureK)
+                EngineVisualMode.STRESS -> lerp(palette.stressBase, palette.errorColor, windingStressFraction.coerceIn(0.0, 1.0).toFloat())
+            },
+            palette = palette,
         )
     }
+}
+
+private class EnginePalette(
+    val neutralMetal: Color,
+    val strongMetal: Color,
+    val spokeColor: Color,
+    val primaryColor: Color,
+    val errorColor: Color,
+    val stressBase: Color,
+    val housingColor: Color,
+    val waterColor: Color,
+    val flameColor: Color,
+    val smokeColor: Color,
+)
+
+private fun DrawScope.drawBaseplate(baseY: Float, left: Float, right: Float, palette: EnginePalette) {
+    drawRoundRect(
+        color = palette.housingColor,
+        topLeft = Offset(left, baseY),
+        size = Size(right - left, size.height * 0.05f),
+        cornerRadius = CornerRadius(3f),
+    )
+    // Foundation bolts along the baseplate
+    var x = left + 12f
+    while (x < right - 12f) {
+        drawCircle(color = palette.neutralMetal, radius = 2.5f, center = Offset(x, baseY + size.height * 0.025f))
+        x += 26f
+    }
+}
+
+private fun DrawScope.drawBoiler(
+    left: Float,
+    right: Float,
+    top: Float,
+    heightPx: Float,
+    baseY: Float,
+    waterLevelFraction: Double,
+    flameActive: Boolean,
+    animationPhase: Float,
+    shellColor: Color,
+    palette: EnginePalette,
+) {
+    // Support legs down to the baseplate
+    drawRect(color = palette.strongMetal, topLeft = Offset(left + 4f, top + heightPx), size = Size(5f, baseY - (top + heightPx)))
+    drawRect(color = palette.strongMetal, topLeft = Offset(right - 9f, top + heightPx), size = Size(5f, baseY - (top + heightPx)))
+
+    drawRoundRect(
+        color = palette.housingColor,
+        topLeft = Offset(left, top),
+        size = Size(right - left, heightPx),
+        cornerRadius = CornerRadius(heightPx * 0.22f),
+    )
+    // Water fill, from the bottom, real level fraction
+    val waterFillHeight = (heightPx - 6f) * waterLevelFraction.toFloat()
+    drawRoundRect(
+        color = palette.waterColor,
+        topLeft = Offset(left + 3f, top + heightPx - 3f - waterFillHeight),
+        size = Size(right - left - 6f, waterFillHeight),
+        cornerRadius = CornerRadius(heightPx * 0.16f),
+    )
+    drawRoundRect(
+        color = shellColor,
+        topLeft = Offset(left, top),
+        size = Size(right - left, heightPx),
+        cornerRadius = CornerRadius(heightPx * 0.22f),
+        style = Stroke(width = 4f),
+    )
+    // Rivet seams: two rows along the shell, a real riveted-boiler-plate detail
+    val rivetRowYs = listOf(top + heightPx * 0.28f, top + heightPx * 0.72f)
+    for (rowY in rivetRowYs) {
+        var x = left + heightPx * 0.22f
+        while (x < right - heightPx * 0.18f) {
+            drawCircle(color = palette.housingColor.copy(alpha = 0.6f), radius = 2f, center = Offset(x, rowY))
+            x += (right - left) * 0.14f
+        }
+    }
+    // Dome on top with a relief-valve nub
+    val domeCenterX = left + (right - left) * 0.32f
+    drawCircle(color = palette.housingColor, radius = heightPx * 0.14f, center = Offset(domeCenterX, top))
+    drawCircle(color = shellColor, radius = heightPx * 0.14f, center = Offset(domeCenterX, top), style = Stroke(width = 3f))
+    drawRect(
+        color = palette.strongMetal,
+        topLeft = Offset(domeCenterX - 3f, top - heightPx * 0.14f - 8f),
+        size = Size(6f, 8f),
+    )
+
+    // Chimney rising from the firebox end, with rising exhaust wisps while lit
+    val chimneyX = left + heightPx * 0.16f
+    val chimneyTop = top - heightPx * 0.30f
+    drawRect(color = palette.housingColor, topLeft = Offset(chimneyX - 5f, chimneyTop), size = Size(10f, top - chimneyTop))
+    drawRect(color = palette.neutralMetal, topLeft = Offset(chimneyX - 5f, chimneyTop), size = Size(10f, top - chimneyTop), style = Stroke(width = 2f))
+    if (flameActive) {
+        repeat(4) { i ->
+            val loopLength = 46f
+            val speed = 14f
+            val phase = (animationPhase * speed + i * (loopLength / 4f)) % loopLength
+            val puffAlpha = (1f - phase / loopLength).coerceIn(0f, 1f)
+            val drift = sin((animationPhase + i) * 1.7f) * 5f
+            drawCircle(
+                color = palette.smokeColor.copy(alpha = palette.smokeColor.alpha * puffAlpha),
+                radius = 4f + phase * 0.12f,
+                center = Offset(chimneyX + drift, chimneyTop - phase),
+            )
+        }
+    }
+
+    // Firebox flame, a real status cue (lit or not), gently flickering while lit
+    val fireboxCenterX = (left + right) / 2f
+    val fireboxY = top + heightPx + size.height * 0.03f
+    if (flameActive) {
+        val flicker = 0.75f + 0.25f * sin(animationPhase * 15f)
+        val flameHeight = size.height * 0.08f * flicker
+        drawCircle(
+            color = palette.flameColor.copy(alpha = 0.35f * flicker),
+            radius = flameHeight * 1.4f,
+            center = Offset(fireboxCenterX, fireboxY),
+        )
+        drawCircle(color = palette.flameColor, radius = flameHeight * 0.7f, center = Offset(fireboxCenterX, fireboxY))
+    } else {
+        drawCircle(color = palette.housingColor, radius = size.height * 0.045f, center = Offset(fireboxCenterX, fireboxY))
+    }
+}
+
+private fun DrawScope.drawSteamPipe(fromX: Float, toX: Float, atY: Float, downToY: Float, palette: EnginePalette) {
+    // Drawn as a double line (an outer housing line plus a thinner inner highlight) so
+    // the pipe reads as a hollow tube rather than a flat wire.
+    drawLine(color = palette.housingColor, start = Offset(fromX, atY), end = Offset(toX, atY), strokeWidth = 7f, cap = StrokeCap.Round)
+    drawLine(color = palette.strongMetal, start = Offset(fromX, atY), end = Offset(toX, atY), strokeWidth = 4f, cap = StrokeCap.Round)
+    drawLine(color = palette.housingColor, start = Offset(toX, atY), end = Offset(toX, downToY), strokeWidth = 7f, cap = StrokeCap.Round)
+    drawLine(color = palette.strongMetal, start = Offset(toX, atY), end = Offset(toX, downToY), strokeWidth = 4f, cap = StrokeCap.Round)
+    // Flange rings at both ends
+    drawCircle(color = palette.strongMetal, radius = 5f, center = Offset(fromX, atY), style = Stroke(width = 2f))
+    drawCircle(color = palette.strongMetal, radius = 5f, center = Offset(toX, atY), style = Stroke(width = 2f))
+}
+
+/** Returns the piston's current center X, so the crosshead/rod drawing can follow it. */
+private fun DrawScope.drawCylinderAndPiston(
+    cylinderLeft: Float,
+    cylinderRight: Float,
+    cylinderTop: Float,
+    cylinderHeight: Float,
+    theta: Double,
+    fillColor: Color,
+    palette: EnginePalette,
+): Float {
+    val strokeVisualPx = cylinderRight - cylinderLeft - size.height * 0.18f
+    val crankRadiusRatio = 0.06 // r/L ratio for the visual slider-crank approximation
+    val displacementFraction = 0.5 * (1 - cos(theta)) + (crankRadiusRatio / 4.0) * (1 - cos(2 * theta))
+    val pistonCenterX = (cylinderLeft + size.height * 0.09f + displacementFraction * strokeVisualPx).toFloat()
+
+    // Steam chest on top of the cylinder (the valve box real double-acting engines have)
+    val chestHeight = cylinderHeight * 0.32f
+    drawRoundRect(
+        color = palette.housingColor,
+        topLeft = Offset(cylinderLeft + cylinderHeight * 0.3f, cylinderTop - chestHeight),
+        size = Size((cylinderRight - cylinderLeft) * 0.55f, chestHeight),
+        cornerRadius = CornerRadius(4f),
+    )
+    drawRoundRect(
+        color = palette.neutralMetal,
+        topLeft = Offset(cylinderLeft + cylinderHeight * 0.3f, cylinderTop - chestHeight),
+        size = Size((cylinderRight - cylinderLeft) * 0.55f, chestHeight),
+        cornerRadius = CornerRadius(4f),
+        style = Stroke(width = 2f),
+    )
+
+    drawRoundRect(
+        color = palette.housingColor,
+        topLeft = Offset(cylinderLeft, cylinderTop),
+        size = Size(cylinderRight - cylinderLeft, cylinderHeight),
+        cornerRadius = CornerRadius(cylinderHeight * 0.25f),
+    )
+    drawRoundRect(
+        color = fillColor,
+        topLeft = Offset(pistonCenterX, cylinderTop + 4f),
+        size = Size((cylinderRight - pistonCenterX).coerceAtLeast(0f), cylinderHeight - 8f),
+        cornerRadius = CornerRadius(cylinderHeight * 0.2f),
+    )
+    drawRoundRect(
+        color = palette.neutralMetal,
+        topLeft = Offset(cylinderLeft, cylinderTop),
+        size = Size(cylinderRight - cylinderLeft, cylinderHeight),
+        cornerRadius = CornerRadius(cylinderHeight * 0.25f),
+        style = Stroke(width = 3f),
+    )
+    // Cylinder head bolt rings at both ends, a real machined-flange detail
+    for (endX in listOf(cylinderLeft + 6f, cylinderRight - 6f)) {
+        for (frac in listOf(0.2f, 0.5f, 0.8f)) {
+            drawCircle(
+                color = palette.spokeColor,
+                radius = 1.6f,
+                center = Offset(endX, cylinderTop + cylinderHeight * frac),
+            )
+        }
+    }
+
+    val pistonWidth = size.height * 0.055f
+    drawRect(
+        color = palette.strongMetal,
+        topLeft = Offset(pistonCenterX - pistonWidth / 2f, cylinderTop - 3f),
+        size = Size(pistonWidth, cylinderHeight + 6f),
+    )
+    return pistonCenterX
+}
+
+private fun DrawScope.drawCrossheadAndRod(pistonCenterX: Float, railY: Float, crankPin: Offset, palette: EnginePalette) {
+    // Guide rails the crosshead slides between - real double-acting engines don't let
+    // the connecting rod push straight on the piston, a crosshead takes the side load.
+    val railHalfSpan = size.height * 0.05f
+    drawLine(
+        color = palette.spokeColor,
+        start = Offset(pistonCenterX, railY - railHalfSpan),
+        end = Offset(crankPin.x, railY - railHalfSpan),
+        strokeWidth = 1.5f,
+    )
+    drawLine(
+        color = palette.spokeColor,
+        start = Offset(pistonCenterX, railY + railHalfSpan),
+        end = Offset(crankPin.x, railY + railHalfSpan),
+        strokeWidth = 1.5f,
+    )
+    drawRect(
+        color = palette.strongMetal,
+        topLeft = Offset(pistonCenterX - 5f, railY - railHalfSpan * 0.8f),
+        size = Size(10f, railHalfSpan * 1.6f),
+    )
+    drawLine(
+        color = palette.strongMetal,
+        start = Offset(pistonCenterX, railY),
+        end = crankPin,
+        strokeWidth = 4f,
+        cap = StrokeCap.Round,
+    )
+}
+
+private fun DrawScope.drawFlywheel(
+    center: Offset,
+    radius: Float,
+    theta: Double,
+    crankPin: Offset,
+    rimColor: Color,
+    palette: EnginePalette,
+) {
+    // Outer shadow ring for depth, then the real colored rim on top
+    drawCircle(color = palette.housingColor, radius = radius + 3f, center = center, style = Stroke(width = 4f))
+    drawCircle(color = rimColor, radius = radius, center = center, style = Stroke(width = 11f))
+
+    val spokeCount = 6
+    repeat(spokeCount) { i ->
+        val spokeAngle = (2 * PI / spokeCount) * i + theta
+        val end = Offset(
+            center.x + (radius * 0.88f * cos(spokeAngle)).toFloat(),
+            center.y + (radius * 0.88f * sin(spokeAngle)).toFloat(),
+        )
+        // Tapered look: a wide stroke near the hub, thin highlight line for depth
+        drawLine(color = palette.spokeColor, start = center, end = end, strokeWidth = 6f, cap = StrokeCap.Round)
+        drawLine(color = palette.neutralMetal, start = center, end = end, strokeWidth = 1.5f)
+    }
+
+    // Hub boss with bolt-hole ring
+    val hubRadius = radius * 0.2f
+    drawCircle(color = palette.housingColor, radius = hubRadius, center = center)
+    drawCircle(color = palette.strongMetal, radius = hubRadius, center = center, style = Stroke(width = 2f))
+    repeat(5) { i ->
+        val a = (2 * PI / 5) * i + theta
+        drawCircle(
+            color = palette.spokeColor,
+            radius = 1.6f,
+            center = Offset(center.x + (hubRadius * 0.6f * cos(a)).toFloat(), center.y + (hubRadius * 0.6f * sin(a)).toFloat()),
+        )
+    }
+    drawCircle(color = palette.strongMetal, radius = 6f, center = crankPin)
+
+    // Counterweight opposite the crank pin, real practice to balance a reciprocating load
+    val counterAngle = theta + PI
+    val counterOuter = Offset(
+        center.x + (radius * 0.92f * cos(counterAngle)).toFloat(),
+        center.y + (radius * 0.92f * sin(counterAngle)).toFloat(),
+    )
+    drawCircle(color = palette.housingColor, radius = radius * 0.16f, center = counterOuter)
+}
+
+private fun DrawScope.drawGenerator(
+    center: Offset,
+    radius: Float,
+    theta: Double,
+    baseY: Float,
+    currentFlowing: Boolean,
+    drumColor: Color,
+    palette: EnginePalette,
+) {
+    // Mounting feet down to the baseplate
+    drawRect(color = palette.strongMetal, topLeft = Offset(center.x - radius * 0.7f, center.y + radius * 0.6f), size = Size(6f, baseY - (center.y + radius * 0.6f)))
+    drawRect(color = palette.strongMetal, topLeft = Offset(center.x + radius * 0.6f, center.y + radius * 0.6f), size = Size(6f, baseY - (center.y + radius * 0.6f)))
+
+    drawCircle(color = palette.housingColor, radius = radius, center = center)
+    drawCircle(color = drumColor, radius = radius, center = center, style = Stroke(width = 10f))
+
+    // Cooling fins around the housing edge
+    repeat(14) { i ->
+        val angle = (2 * PI / 14) * i
+        val inner = Offset(center.x + (radius * 0.98f * cos(angle)).toFloat(), center.y + (radius * 0.98f * sin(angle)).toFloat())
+        val outer = Offset(center.x + (radius * 1.1f * cos(angle)).toFloat(), center.y + (radius * 1.1f * sin(angle)).toFloat())
+        drawLine(color = palette.neutralMetal, start = inner, end = outer, strokeWidth = 1.5f)
+    }
+
+    // Winding coil arcs on the drum face, rotating with the shaft
+    repeat(4) { i ->
+        val angle = (2 * PI / 4) * i + theta * 2.0
+        val a = Offset(
+            center.x + (radius * 0.55f * cos(angle)).toFloat(),
+            center.y + (radius * 0.55f * sin(angle)).toFloat(),
+        )
+        drawCircle(color = palette.spokeColor, radius = radius * 0.12f, center = a, style = Stroke(width = 3f))
+    }
+
+    // Terminal posts and wires to a small terminal block below
+    val postY = center.y - radius * 0.55f
+    val leftPost = Offset(center.x - radius * 0.35f, postY)
+    val rightPost = Offset(center.x + radius * 0.35f, postY)
+    drawCircle(color = palette.strongMetal, radius = 3f, center = leftPost)
+    drawCircle(color = palette.strongMetal, radius = 3f, center = rightPost)
+    val blockTop = center.y - radius * 1.35f
+    drawRect(color = palette.housingColor, topLeft = Offset(center.x - radius * 0.4f, blockTop), size = Size(radius * 0.8f, radius * 0.28f))
+    drawLine(color = if (currentFlowing) Color(0xFFFFE9A6) else palette.neutralMetal, start = leftPost, end = Offset(leftPost.x, blockTop + radius * 0.28f), strokeWidth = 2f)
+    drawLine(color = if (currentFlowing) Color(0xFFFFE9A6) else palette.neutralMetal, start = rightPost, end = Offset(rightPost.x, blockTop + radius * 0.28f), strokeWidth = 2f)
+
+    // Brush spark: lit only while current is actually flowing to a real load
+    drawCircle(
+        color = if (currentFlowing) Color(0xFFFFE9A6) else palette.housingColor,
+        radius = radius * 0.22f,
+        center = center,
+    )
 }
 
 /** Cool blue-gray near vacuum, neutral at atmospheric, hot orange-white under real boiler pressure. */
