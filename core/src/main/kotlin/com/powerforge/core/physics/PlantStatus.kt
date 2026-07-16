@@ -35,6 +35,7 @@ data class PlantStatus(
     val boilerWaterLevelFraction: Double,
     val boilerScalePercent: Double,
     val cylinderPressurePa: Double,
+    val cylinderTemperatureK: Double,
     val crankAngleRad: Double,
     val angularVelocityRadPerS: Double,
     val rpm: Double,
@@ -49,6 +50,13 @@ data class PlantStatus(
     val circuitBreakerClosed: Boolean,
     val drainCocksOpen: Boolean,
     val blowdownValveOpen: Boolean,
+    val flameActive: Boolean,
+    /** Real bond tension in the flywheel rim's lattice vs. the real tension that snaps it - 1.0 is burst, not a chosen number. */
+    val flywheelStressFraction: Double,
+    /** Real boiler saturation pressure vs. its real design rupture pressure - 1.0 is rupture, not a chosen number. */
+    val boilerStressFraction: Double,
+    /** Real winding temperature vs. the real insulation class's max rated temperature - 1.0 is burnout, not a chosen number. */
+    val windingStressFraction: Double,
     val isDamaged: Boolean,
     val failureReason: FailureReason,
 ) {

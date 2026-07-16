@@ -18,7 +18,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -34,18 +37,38 @@ import kotlin.math.roundToInt
 fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Modifier) {
     val state by viewModel.uiState.collectAsState()
     val latestState = rememberUpdatedState(state)
+    var visualMode by remember { mutableStateOf(EngineVisualMode.NORMAL) }
 
     Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(modifier = Modifier.fillMaxSize()) {
             HeaderBar(state)
 
-            EngineMechanismVisual(
+            EngineVisualModeSelector(
+                mode = visualMode,
+                onModeChange = { visualMode = it },
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+
+            EngineVisual(
+                mode = visualMode,
                 rpmProvider = { latestState.value.rpm },
                 crankAngleRadProvider = { latestState.value.crankAngleRad },
-                cylinderPressurePaProvider = { latestState.value.cylinderPressurePa },
+                cylinderPressurePa = state.cylinderPressurePa,
+                cylinderTemperatureK = state.cylinderTemperatureK,
+                boilerTemperatureK = state.boilerTemperatureK,
+                boilerWaterLevelFraction = state.boilerWaterLevelFraction,
+                boilerStressFraction = state.boilerStressFraction,
+                flywheelStressFraction = state.flywheelStressFraction,
+                windingStressFraction = state.windingStressFraction,
+                rotorWindingTemperatureK = state.rotorWindingTemperatureK,
+                flameActive = state.flameActive,
+                generatorEngaged = state.controls.clutchEngaged && state.controls.circuitBreakerClosed,
+                electricalPowerW = state.electricalPowerW,
                 isFailing = state.isFailing,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
             )
+
+            EngineVisualLegend(mode = visualMode, state = state)
 
             if (state.isDamaged) {
                 DamageBanner(state, onRepair = viewModel::repair)
@@ -167,6 +190,28 @@ private fun WarningBanner(state: PlantUiState) {
             style = MaterialTheme.typography.bodyMedium,
         )
     }
+}
+
+@Composable
+private fun EngineVisualLegend(mode: EngineVisualMode, state: PlantUiState) {
+    val text = when (mode) {
+        EngineVisualMode.NORMAL ->
+            "Steam ${(state.cylinderPressurePa / 1000).roundToInt()} kPa · Water ${(state.boilerWaterLevelFraction * 100).roundToInt()}%"
+        EngineVisualMode.THERMAL ->
+            "Boiler ${(state.boilerTemperatureK - 273.15).roundToInt()}°C · " +
+                "Cylinder ${(state.cylinderTemperatureK - 273.15).roundToInt()}°C · " +
+                "Windings ${(state.rotorWindingTemperatureK - 273.15).roundToInt()}°C"
+        EngineVisualMode.STRESS ->
+            "Flywheel ${(state.flywheelStressFraction * 100).roundToInt()}% of burst · " +
+                "Boiler ${(state.boilerStressFraction * 100).roundToInt()}% of rupture · " +
+                "Windings ${(state.windingStressFraction * 100).roundToInt()}% of max"
+    }
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+    )
 }
 
 @Composable

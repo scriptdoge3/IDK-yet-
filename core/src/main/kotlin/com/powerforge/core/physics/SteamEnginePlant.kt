@@ -731,6 +731,7 @@ class SteamEnginePlant(
             boilerWaterLevelFraction = (boilerWaterMassKg / boiler.waterCapacityKg).coerceIn(0.0, 1.0),
             boilerScalePercent = boilerScalePercent,
             cylinderPressurePa = cylinderPressurePa,
+            cylinderTemperatureK = kineticGas.lastTemperatureK,
             crankAngleRad = crankAngleRad,
             angularVelocityRadPerS = angularVelocityRadPerS,
             rpm = angularVelocityRadPerS * 60.0 / (2.0 * PI),
@@ -745,6 +746,10 @@ class SteamEnginePlant(
             circuitBreakerClosed = circuitBreakerSwitch.effective,
             drainCocksOpen = drainCocksSwitch.effective,
             blowdownValveOpen = blowdownValveSwitch.effective,
+            flameActive = effectiveHeatInputW > 0.0,
+            flywheelStressFraction = flywheelLattice.stressFraction,
+            boilerStressFraction = saturationPressurePa(boilerTemperatureK) / (boiler.maxPressurePa * boilerRuptureMargin),
+            windingStressFraction = rotorWindingTemperatureK / rotor.maxWindingTemperatureK,
             isDamaged = isDamaged,
             failureReason = failureReason,
         )

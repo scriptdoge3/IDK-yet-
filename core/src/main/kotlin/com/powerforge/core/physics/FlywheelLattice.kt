@@ -62,6 +62,14 @@ class FlywheelLattice(private val pointCount: Int = 24) {
     var peakBondTensionN: Double = 0.0
         private set
 
+    /**
+     * How close the rim's actual worst bond tension is to the real breaking tension
+     * that bond can carry - 1.0 is the instant a bond snaps, not a chosen threshold,
+     * the same ratio [step] itself checks internally.
+     */
+    val stressFraction: Double
+        get() = if (maxBondTensionN > 1e-9) (peakBondTensionN / maxBondTensionN) else 0.0
+
     fun configure(flywheel: Flywheel) {
         if (configuredForLevel == flywheel.level) return
         configuredForLevel = flywheel.level
