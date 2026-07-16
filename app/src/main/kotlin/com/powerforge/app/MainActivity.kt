@@ -3,7 +3,7 @@ package com.powerforge.app
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import com.powerforge.app.ui.PlantScreen
+import com.powerforge.app.ui.AppRoot
 import com.powerforge.app.ui.theme.PowerForgeTheme
 
 class MainActivity : ComponentActivity() {
@@ -12,7 +12,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             PowerForgeTheme {
-                PlantScreen()
+                AppRoot()
             }
         }
     }

@@ -32,11 +32,11 @@ import com.powerforge.core.physics.FailureReason
 import kotlin.math.roundToInt
 
 @Composable
-fun PlantScreen(viewModel: PlantViewModel = viewModel()) {
+fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Modifier) {
     val state by viewModel.uiState.collectAsState()
     val latestState = rememberUpdatedState(state)
 
-    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+    Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(modifier = Modifier.fillMaxSize()) {
             HeaderBar(state)
 
@@ -56,14 +56,26 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel()) {
 
             LazyColumn(
                 modifier = Modifier.fillMaxWidth().weight(1f),
-                contentPadding = PaddingValues(16.dp),
+                contentPadding = PaddingValues(bottom = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(state.parts) { part ->
+                item {
+                    PlantControlsPanel(
+                        controls = state.controls,
+                        onThrottleChange = viewModel::setThrottle,
+                        onFuelValveChange = viewModel::setFuelValve,
+                        onIgnitionChange = viewModel::setIgnition,
+                        onGeneratorEngagedChange = viewModel::setGeneratorEngaged,
+                        onSafetyValveChange = viewModel::setSafetyValveOpen,
+                        onAddLubrication = viewModel::addLubrication,
+                    )
+                }
+                items(state.parts, key = { it.kind }) { part ->
                     PartUpgradeCard(
                         part = part,
                         canAfford = state.credits >= part.upgradeCost,
                         onUpgrade = { viewModel.upgrade(part.kind) },
+                        modifier = Modifier.padding(horizontal = 16.dp),
                     )
                 }
             }
@@ -80,11 +92,18 @@ private fun HeaderBar(state: PlantUiState) {
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text("PowerForge", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Text(
-            "${state.credits.roundToInt()} cr",
-            style = MaterialTheme.typography.titleLarge,
-            color = MaterialTheme.colorScheme.primary,
-        )
+        Column(horizontalAlignment = Alignment.End) {
+            Text(
+                "${state.credits.roundToInt()} cr",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                "${state.researchPoints.roundToInt()} RP",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+        }
     }
 }
 
@@ -97,6 +116,7 @@ private fun WarningBanner(state: PlantUiState) {
                 "Upgrade the Frame & Bearings to support it."
         FailureReason.STALLED_INSUFFICIENT_TORQUE ->
             "Building steam pressure... the boiler hasn't reached enough pressure to overcome friction yet."
+        FailureReason.IGNITION_OFF -> "Burner is shut off. Switch ignition on to build pressure again."
         FailureReason.NONE -> ""
     }
     Surface(
@@ -135,9 +155,14 @@ private fun StatItem(label: String, value: String) {
 }
 
 @Composable
-private fun PartUpgradeCard(part: PartUiState, canAfford: Boolean, onUpgrade: () -> Unit) {
+private fun PartUpgradeCard(
+    part: PartUiState,
+    canAfford: Boolean,
+    onUpgrade: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
     ) {
         Row(
@@ -146,15 +171,23 @@ private fun PartUpgradeCard(part: PartUiState, canAfford: Boolean, onUpgrade: ()
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("${part.label}  Lv.${part.level}", fontWeight = FontWeight.SemiBold)
+                Text("${part.label}  Lv.${part.level} / ${part.maxLevel}", fontWeight = FontWeight.SemiBold)
                 Text(
                     part.summary,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                 )
             }
-            Button(onClick = onUpgrade, enabled = canAfford) {
-                Text("${part.upgradeCost} cr")
+            if (part.isLevelCapped) {
+                Text(
+                    "Research required",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                )
+            } else {
+                Button(onClick = onUpgrade, enabled = canAfford) {
+                    Text("${part.upgradeCost} cr")
+                }
             }
         }
     }

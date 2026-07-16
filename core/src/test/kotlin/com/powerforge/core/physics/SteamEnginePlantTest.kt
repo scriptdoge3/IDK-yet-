@@ -89,4 +89,53 @@ class SteamEnginePlantTest {
         val p = saturationPressurePa(373.15)
         assertEquals(PhysicsConstants.ATMOSPHERIC_PRESSURE_PA, p, 1.0)
     }
+
+    @Test
+    fun `closing the throttle reduces power output`() {
+        val fullThrottle = runToSteadyState(SteamEnginePlant())
+
+        val halfThrottlePlant = SteamEnginePlant().apply { throttleFraction = 0.5 }
+        val halfThrottle = runToSteadyState(halfThrottlePlant)
+
+        println("full=${fullThrottle.electricalPowerW}W half=${halfThrottle.electricalPowerW}W")
+        assertTrue(halfThrottle.electricalPowerW < fullThrottle.electricalPowerW)
+    }
+
+    @Test
+    fun `turning off ignition stops heat production and the shaft`() {
+        val plant = SteamEnginePlant().apply { ignitionOn = false }
+        val status = runToSteadyState(plant, totalSeconds = 60.0)
+
+        assertEquals(FailureReason.IGNITION_OFF, status.failureReason)
+        assertEquals(0.0, status.electricalPowerW, 1e-9)
+    }
+
+    @Test
+    fun `disengaging the generator lets the shaft spin free with zero electrical output`() {
+        val engaged = runToSteadyState(SteamEnginePlant())
+
+        val disengagedPlant = SteamEnginePlant().apply { generatorEngaged = false }
+        val disengaged = runToSteadyState(disengagedPlant)
+
+        println("engaged rpm=${engaged.rpm} W=${engaged.electricalPowerW}; disengaged rpm=${disengaged.rpm} W=${disengaged.electricalPowerW}")
+        assertEquals(FailureReason.NONE, disengaged.failureReason)
+        assertEquals(0.0, disengaged.electricalPowerW, 1e-9)
+        assertTrue("disengaged flywheel should spin faster with no electromagnetic braking", disengaged.rpm > engaged.rpm)
+    }
+
+    @Test
+    fun `depleted lubrication increases friction and reduces power until topped up`() {
+        val worn = SteamEnginePlant(flywheel = Flywheel(1)).apply {
+            lubricationSystemActive = true
+        }
+        // Run long enough for lubrication to fully deplete, then reach a new steady state.
+        val wornStatus = runToSteadyState(worn, totalSeconds = 3600.0)
+        assertEquals(0.0, worn.lubricationPercent, 1e-6)
+
+        worn.addLubrication()
+        val refreshedStatus = runToSteadyState(worn, totalSeconds = 180.0)
+
+        println("worn W=${wornStatus.electricalPowerW} refreshed W=${refreshedStatus.electricalPowerW}")
+        assertTrue(refreshedStatus.electricalPowerW > wornStatus.electricalPowerW)
+    }
 }
