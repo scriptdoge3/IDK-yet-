@@ -143,6 +143,28 @@ class BoilerThermalSimulation(private val maxParticles: Int = 220, private val t
         if (isFlame[index]) flamePointMassKg[index] else waterPointMassKg
 
     /**
+     * The heat a flue-gas particle actually hands the water in its final pass across the
+     * heat-exchange surface as it exits: the energy it's carrying ABOVE what it would
+     * still hold at the water's own temperature - not its entire kinetic energy. Real
+     * flue gas leaves up the stack at roughly stack/water temperature, carrying that
+     * floor away with it (a real, if modest, stack loss); it does not exit at absolute
+     * zero having surrendered every last joule to the water. A particle that already
+     * thermalized down to the water temperature during its residence (via ordinary
+     * collisions) therefore hands over nothing extra here - it already gave its heat
+     * collision by collision, and what it still carries leaves with it.
+     */
+    private fun flameExitHeatToWaterJ(index: Int, waterTemperatureK: Double): Double {
+        val currentKineticEnergyJ = 0.5 * flamePointMassKg[index] *
+            (vx[index] * vx[index] + vy[index] * vy[index])
+        val realMolecules = flamePointMassKg[index] / PhysicsConstants.FLUE_GAS_MOLECULE_MASS_KG
+        // 2D equipartition floor: at the water's temperature this packet of real
+        // molecules would still hold realMolecules * k * T of kinetic energy, which it
+        // carries out the stack rather than surrendering.
+        val floorKineticEnergyJ = realMolecules * BOLTZMANN_J_PER_K * waterTemperatureK
+        return max(0.0, currentKineticEnergyJ - floorKineticEnergyJ)
+    }
+
+    /**
      * Advances the boiler's thermal state by [dt]. [flamePowerW] is the real chemical
      * heat release rate (the burner's actual output right now); [waterMassKg] the
      * boiler's actual current water mass (its Fn-scaling is recomputed fresh each call
@@ -195,8 +217,7 @@ class BoilerThermalSimulation(private val maxParticles: Int = 220, private val t
                         }
                     }
                     if (oldestFlameIndex < 0) break
-                    flameEnergyReturnedOnEvictionJ += 0.5 * flamePointMassKg[oldestFlameIndex] *
-                        (vx[oldestFlameIndex] * vx[oldestFlameIndex] + vy[oldestFlameIndex] * vy[oldestFlameIndex])
+                    flameEnergyReturnedOnEvictionJ += flameExitHeatToWaterJ(oldestFlameIndex, temperatureK)
                     oldestFlameIndex
                 }
                 isFlame[i] = true
@@ -224,7 +245,7 @@ class BoilerThermalSimulation(private val maxParticles: Int = 220, private val t
             if (isFlame[i]) {
                 residenceRemainingS[i] -= dt
                 if (residenceRemainingS[i] <= 0.0) {
-                    flameEnergyReturnedOnEvictionJ += 0.5 * flamePointMassKg[i] * (vx[i] * vx[i] + vy[i] * vy[i])
+                    flameEnergyReturnedOnEvictionJ += flameExitHeatToWaterJ(i, temperatureK)
                     val last = activeCount - 1
                     vx[i] = vx[last]
                     vy[i] = vy[last]

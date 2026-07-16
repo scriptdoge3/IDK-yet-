@@ -700,7 +700,14 @@ class SteamEnginePlant(
         }
         val resistiveHeatingW = current * current * rotor.internalResistanceOhm
         val overExcitation = max(0.0, effectiveExcitationFraction - 1.0)
-        val fieldWindingHeatingW = if (currentFlows) (3.0 + rotor.level * 0.5) * overExcitation * overExcitation * 260.0 else 0.0
+        // Field-winding I^2R heating from over-excitation happens in the FIELD circuit,
+        // which the excitation supply energizes directly - it does not depend on the
+        // armature breaker being closed or the clutch being engaged (those gate the
+        // separate armature/load circuit, which is what resistiveHeatingW above is
+        // correctly gated on via currentFlows). Over-exciting a generator whose breaker
+        // is open or whose clutch is out still drives current through and cooks the field
+        // winding, so this heating is not gated on currentFlows.
+        val fieldWindingHeatingW = (3.0 + rotor.level * 0.5) * overExcitation * overExcitation * 260.0
         val windingCoolingW = (0.8 + 0.01 * omega) * (rotorWindingTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
         val netWindingHeatW = resistiveHeatingW + fieldWindingHeatingW - windingCoolingW
         rotorWindingTemperatureK = max(
