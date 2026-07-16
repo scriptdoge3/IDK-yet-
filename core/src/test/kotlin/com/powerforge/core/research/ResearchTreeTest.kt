@@ -3,6 +3,7 @@ package com.powerforge.core.research
 import com.powerforge.core.physics.PartKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -25,34 +26,38 @@ class ResearchTreeTest {
     }
 
     @Test
-    fun `boiler tier 2 cannot be researched before tier 1`() {
-        assertFalse(ResearchTree.canResearch("BOILER_T2", emptySet()))
-        assertTrue(ResearchTree.canResearch("BOILER_T1", emptySet()))
-        assertTrue(ResearchTree.canResearch("BOILER_T2", setOf("BOILER_T1")))
+    fun `boiler level 4 cannot be researched before level 3`() {
+        assertFalse(ResearchTree.canResearch("BOILER_LV4", emptySet()))
+        assertTrue(ResearchTree.canResearch("BOILER_LV2", emptySet()))
+        assertTrue(ResearchTree.canResearch("BOILER_LV3", setOf("BOILER_LV2")))
+        assertTrue(ResearchTree.canResearch("BOILER_LV4", setOf("BOILER_LV2", "BOILER_LV3")))
     }
 
     @Test
-    fun `max level starts at baseline and rises with researched tiers`() {
-        assertEquals(ResearchTree.BASELINE_MAX_LEVEL, ResearchTree.maxLevelFor(PartKind.BOILER, emptySet()))
-        assertEquals(4, ResearchTree.maxLevelFor(PartKind.BOILER, setOf("BOILER_T1")))
-        assertEquals(8, ResearchTree.maxLevelFor(PartKind.BOILER, setOf("BOILER_T1", "BOILER_T2")))
-        assertEquals(15, ResearchTree.maxLevelFor(PartKind.BOILER, setOf("BOILER_T1", "BOILER_T2", "BOILER_T3")))
-    }
-
-    @Test
-    fun `controls stay locked until their operations node is researched`() {
-        assertFalse(ResearchTree.isControlUnlocked(ControlUnlock.THROTTLE, emptySet()))
-        assertTrue(ResearchTree.isControlUnlocked(ControlUnlock.THROTTLE, setOf("OPS_THROTTLE")))
-    }
-
-    @Test
-    fun `manual relief valve requires the throttle valve first`() {
-        assertFalse(ResearchTree.canResearch("OPS_SAFETY", emptySet()))
-        assertTrue(ResearchTree.canResearch("OPS_SAFETY", setOf("OPS_THROTTLE")))
+    fun `next node id follows the current level`() {
+        assertEquals("BOILER_LV2", ResearchTree.nextNodeIdFor(PartKind.BOILER, 1))
+        assertEquals("BOILER_LV5", ResearchTree.nextNodeIdFor(PartKind.BOILER, 4))
+        assertNull(ResearchTree.nextNodeIdFor(PartKind.BOILER, ResearchTree.MAX_LEVEL))
     }
 
     @Test
     fun `already researched nodes cannot be researched again`() {
-        assertFalse(ResearchTree.canResearch("OPS_THROTTLE", setOf("OPS_THROTTLE")))
+        assertFalse(ResearchTree.canResearch("BOILER_LV2", setOf("BOILER_LV2")))
+    }
+
+    @Test
+    fun `costs rise with level`() {
+        val cheap = ResearchTree.byId.getValue("BOILER_LV2").costRp
+        val pricier = ResearchTree.byId.getValue("BOILER_LV10").costRp
+        assertTrue(pricier > cheap)
+    }
+
+    @Test
+    fun `every part has a full chain from level 2 to max level`() {
+        PartKind.entries.forEach { kind ->
+            for (level in 2..ResearchTree.MAX_LEVEL) {
+                assertTrue("missing node for $kind level $level", "${kind.name}_LV$level" in ResearchTree.byId)
+            }
+        }
     }
 }

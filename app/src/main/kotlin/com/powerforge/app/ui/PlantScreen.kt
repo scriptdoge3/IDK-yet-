@@ -48,7 +48,9 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Mo
                 )
             }
 
-            if (state.isFailing) {
+            if (state.isDamaged) {
+                DamageBanner(state, onRepair = viewModel::repair)
+            } else if (state.isFailing) {
                 WarningBanner(state)
             }
 
@@ -63,20 +65,27 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Mo
                     PlantControlsPanel(
                         controls = state.controls,
                         onThrottleChange = viewModel::setThrottle,
+                        onCutoffChange = viewModel::setCutoff,
                         onFuelValveChange = viewModel::setFuelValve,
                         onIgnitionChange = viewModel::setIgnition,
-                        onGeneratorEngagedChange = viewModel::setGeneratorEngaged,
+                        onFeedwaterValveChange = viewModel::setFeedwaterValve,
                         onSafetyValveChange = viewModel::setSafetyValveOpen,
-                        onAddLubrication = viewModel::addLubrication,
+                        onExcitationChange = viewModel::setExcitation,
+                        onClutchChange = viewModel::setClutchEngaged,
+                        onEmergencyBrakeChange = viewModel::setEmergencyBrake,
+                        onAddOil = viewModel::addOil,
+                    )
+                }
+                item {
+                    Text(
+                        "Plant",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp),
                     )
                 }
                 items(state.parts, key = { it.kind }) { part ->
-                    PartUpgradeCard(
-                        part = part,
-                        canAfford = state.credits >= part.upgradeCost,
-                        onUpgrade = { viewModel.upgrade(part.kind) },
-                        modifier = Modifier.padding(horizontal = 16.dp),
-                    )
+                    PartSummaryCard(part = part, modifier = Modifier.padding(horizontal = 16.dp))
                 }
             }
         }
@@ -108,16 +117,39 @@ private fun HeaderBar(state: PlantUiState) {
 }
 
 @Composable
+private fun DamageBanner(state: PlantUiState, onRepair: () -> Unit) {
+    val message = when (state.failureReason) {
+        FailureReason.FLYWHEEL_BURST -> "FLYWHEEL BURST: it was spun past its rated tip speed and let go."
+        FailureReason.BOILER_RUPTURED -> "BOILER RUPTURED: pressure ran past its rated limit faster than relief could bleed it."
+        FailureReason.BOILER_DRY_FIRE -> "BOILER FIRED DRY: it was fired with no water left in it."
+        FailureReason.BEARING_SEIZED -> "BEARINGS SEIZED: they ran dry too long and galled solid."
+        FailureReason.ROTOR_BURNOUT -> "ROTOR BURNED OUT: windings overheated from too much excitation/current."
+        else -> "PLANT DAMAGED."
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        color = MaterialTheme.colorScheme.error.copy(alpha = 0.2f),
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(text = message, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            Button(onClick = onRepair, modifier = Modifier.padding(top = 8.dp)) {
+                Text("Repair (${state.repairCostCredits} cr)")
+            }
+        }
+    }
+}
+
+@Composable
 private fun WarningBanner(state: PlantUiState) {
     val message = when (state.failureReason) {
         FailureReason.STRUCTURAL_OVERLOAD ->
             "TOO HEAVY: the flywheel + rotor (${"%.2f".format(state.rotatingAssemblyMassKg)} kg) " +
                 "exceed what the frame can carry (${"%.2f".format(state.maxSupportedRotatingMassKg)} kg). " +
-                "Upgrade the Frame & Bearings to support it."
+                "Research the Frame & Bearings to support it."
         FailureReason.STALLED_INSUFFICIENT_TORQUE ->
             "Building steam pressure... the boiler hasn't reached enough pressure to overcome friction yet."
         FailureReason.IGNITION_OFF -> "Burner is shut off. Switch ignition on to build pressure again."
-        FailureReason.NONE -> ""
+        else -> ""
     }
     Surface(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
@@ -142,6 +174,7 @@ private fun StatsPanel(state: PlantUiState) {
         StatItem("RPM", "${state.rpm.roundToInt()}")
         StatItem("Boiler", "${(state.boilerTemperatureK - 273.15).roundToInt()}°C")
         StatItem("Pressure", "${(state.boilerPressurePa / 1000).roundToInt()} kPa")
+        StatItem("Water", "${(state.boilerWaterLevelFraction * 100).roundToInt()}%")
         StatItem("Efficiency", "${"%.1f".format(state.overallEfficiency * 100)}%")
     }
 }
@@ -155,40 +188,18 @@ private fun StatItem(label: String, value: String) {
 }
 
 @Composable
-private fun PartUpgradeCard(
-    part: PartUiState,
-    canAfford: Boolean,
-    onUpgrade: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
+private fun PartSummaryCard(part: PartUiState, modifier: Modifier = Modifier) {
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(14.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("${part.label}  Lv.${part.level} / ${part.maxLevel}", fontWeight = FontWeight.SemiBold)
-                Text(
-                    part.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
-                )
-            }
-            if (part.isLevelCapped) {
-                Text(
-                    "Research required",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
-                )
-            } else {
-                Button(onClick = onUpgrade, enabled = canAfford) {
-                    Text("${part.upgradeCost} cr")
-                }
-            }
+        Column(modifier = Modifier.fillMaxWidth().padding(14.dp)) {
+            Text("${part.label}  Lv.${part.level}", fontWeight = FontWeight.SemiBold)
+            Text(
+                part.summary,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+            )
         }
     }
 }

@@ -11,7 +11,5 @@ dependencies {
 }
 
 tasks.test {
-    testLogging {
-        showStandardStreams = true
-    }
+    testLogging { showStandardStreams = true }
 }

@@ -6,16 +6,19 @@ import kotlin.math.max
 /**
  * All part properties are derived from an integer [level] so the UI, the save
  * system, and the physics only ever need to agree on one number per part.
+ * Levels only ever come from researching the matching node in the tech tree -
+ * there is no separate purchase step.
  */
 
-/** Burns fuel to heat the boiler water; also the pressure vessel itself. */
+/** Burns fuel to heat the boiler water; also the pressure vessel and water tank itself. */
 data class Boiler(val level: Int) {
     val heatInputW: Double = 1030.0 + (level - 1) * 320.0
-    val waterMassKg: Double = 0.03 + (level - 1) * 0.045
+    val waterCapacityKg: Double = 0.03 + (level - 1) * 0.045
     val insulationLossWPerK: Double = max(0.5, 2.6 - (level - 1) * 0.18)
     val maxPressurePa: Double = 300_000.0 + (level - 1) * 45_000.0
 
-    fun upgradeCost(): Long = upgradeCostCredits(140, level)
+    /** Max rate the feedwater pump/valve can push fresh water into the boiler. */
+    val feedwaterMaxFlowKgPerS: Double = 0.01 + (level - 1) * 0.003
 }
 
 /** Converts boiler pressure into torque via a piston, crank and connecting rod. */
@@ -28,7 +31,8 @@ data class PistonAssembly(val level: Int) {
     val strokeLengthM: Double get() = 2.0 * crankRadiusM
     val sweptVolumeM3: Double get() = pistonAreaM2 * strokeLengthM
 
-    fun upgradeCost(): Long = upgradeCostCredits(160, level)
+    /** Throttle/cutoff valve throat scales with cylinder size - a bigger engine needs a bigger valve. */
+    val maxValveAreaM2: Double get() = pistonAreaM2 * 0.004
 }
 
 /** Smooths torque delivery, but adds rotating mass and inertia to the shaft. */
@@ -39,7 +43,8 @@ data class Flywheel(val level: Int) {
     /** Solid disk: I = 1/2 m r^2. */
     val momentOfInertiaKgM2: Double get() = 0.5 * massKg * radiusM * radiusM
 
-    fun upgradeCost(): Long = upgradeCostCredits(110, level)
+    /** Better rim materials/manufacturing at higher levels raise the safe tip speed before it bursts. */
+    val maxSafeTipSpeedMPerS: Double = 20.0 + (level - 1) * 4.0
 }
 
 /** DC generator equivalent circuit: EMF = ke*omega, current limited by internal + load resistance. */
@@ -49,9 +54,11 @@ data class GeneratorRotor(val level: Int) {
     val backEmfConstantVSPerRad: Double = 0.11 + (level - 1) * 0.045
     val internalResistanceOhm: Double = max(0.12, 0.55 - (level - 1) * 0.035)
 
-    val momentOfInertiaKgM2: Double get() = 0.5 * massKg * radiusM * radiusM
+    /** Insulation class improves with level: higher levels tolerate more winding heat before burnout. */
+    val maxWindingTemperatureK: Double = 420.0 + (level - 1) * 25.0
+    val thermalMassJPerK: Double = 60.0 + (level - 1) * 12.0
 
-    fun upgradeCost(): Long = upgradeCostCredits(190, level)
+    val momentOfInertiaKgM2: Double get() = 0.5 * massKg * radiusM * radiusM
 }
 
 /**
@@ -64,6 +71,4 @@ data class Frame(val level: Int) {
     val bearingFrictionCoeff: Double = max(0.012, 0.045 - (level - 1) * 0.004)
     val viscousFrictionCoeffNmSPerRad: Double = max(0.00015, 0.00065 - (level - 1) * 0.00005)
     val bearingRadiusM: Double = 0.008
-
-    fun upgradeCost(): Long = upgradeCostCredits(220, level)
 }

@@ -1,26 +1,25 @@
 package com.powerforge.core.physics
 
 import kotlin.math.PI
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * A single-cylinder steam engine driving a flywheel and a DC generator rotor.
+ * A single-cylinder steam engine driving a flywheel and a DC generator rotor,
+ * operated through a full real control panel rather than running on autopilot.
  *
- * Each [step] integrates two coupled real state variables forward in time:
- *  - boiler water/steam temperature (drives saturation pressure via Clausius-Clapeyron)
- *  - drivetrain angular velocity (Newton's second law for rotation: I*dw/dt = sum of torques)
+ * State is integrated forward each [step]: boiler temperature and water mass,
+ * drivetrain angular velocity, rotor winding temperature, and bearing lubrication.
+ * Every control folds directly into the same equations - closing the throttle
+ * restricts the compressible mass flow through the valve, cutting the cutoff
+ * shortens the admission phase of the stroke, disengaging the clutch removes the
+ * rotor's inertia and torque interaction from the shaft entirely, and so on.
  *
- * Everything downstream (RPM, electrical watts, whether it runs at all) falls out
- * of those two numbers plus the current part specs, so upgrading a part never needs
- * special-casing: it just changes a coefficient the same equations already use.
- *
- * On top of that, a handful of operator controls modulate the same equations rather
- * than being bolted on as special cases: closing the throttle restricts the pressure
- * the cylinder actually sees, cutting fuel reduces heat input, disengaging the
- * generator zeroes the electromagnetic braking torque, and so on. Every control
- * defaults to "as if it didn't exist" so a plant with no controls unlocked yet
- * behaves exactly like the original always-on engine.
+ * Mismanaging any one of them has a real, permanent consequence: overspeed bursts
+ * the flywheel, sustained overpressure ruptures the boiler, firing it dry cooks it,
+ * neglected bearings seize, and overexcited/overloaded windings burn out. Once
+ * [isDamaged] is true the plant is dead until [repair] is called.
  */
 class SteamEnginePlant(
     var boiler: Boiler = Boiler(1),
@@ -29,16 +28,39 @@ class SteamEnginePlant(
     var rotor: GeneratorRotor = GeneratorRotor(1),
     var frame: Frame = Frame(1),
 ) {
+    // --- State ---
+
     var boilerTemperatureK: Double = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        private set
+
+    var boilerWaterMassKg: Double = boiler.waterCapacityKg
         private set
 
     var angularVelocityRadPerS: Double = 0.0
         private set
 
-    // --- Operator controls (each unlocked independently via research) ---
+    var rotorWindingTemperatureK: Double = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        private set
 
-    /** Steam admission valve: 0 = fully shut, 1 = wide open. Restricts cylinder pressure. */
+    var lubricationPercent: Double = 100.0
+        private set
+
+    var isDamaged: Boolean = false
+        private set
+
+    var damageReason: FailureReason = FailureReason.NONE
+        private set
+
+    private var secondsAtZeroLubricationWhileRunning: Double = 0.0
+    private var secondsDryFiring: Double = 0.0
+
+    // --- Operator controls: the full panel, always present ---
+
+    /** Main steam admission valve: 0 = shut, 1 = wide open. Governs compressible mass flow. */
     var throttleFraction: Double = 1.0
+
+    /** Fraction of the stroke steam is admitted for before cutting off to expand. */
+    var cutoffFraction: Double = 0.75
 
     /** Fuel/air valve on the burner: 0 = no fire, 1 = full burn rate. */
     var fuelValveFraction: Double = 1.0
@@ -46,21 +68,35 @@ class SteamEnginePlant(
     /** Master ignition. When off, no heat is produced regardless of the fuel valve. */
     var ignitionOn: Boolean = true
 
+    /** How hard the feedwater pump is pushing fresh water into the boiler. */
+    var feedwaterValveFraction: Double = 1.0
+
     /** Manually bleeds boiler pressure, independent of the automatic safety relief. */
     var safetyValveOpen: Boolean = false
 
-    /** Whether the generator's armature is actually connected to the load circuit. */
-    var generatorEngaged: Boolean = true
+    /** Generator field strength. 1.0 = rated. Above 1.0 trades winding life for more output. */
+    var excitationFraction: Double = 1.0
 
-    /** Whether the lubrication system is being modeled at all (unlocked via research). */
-    var lubricationSystemActive: Boolean = false
+    /** True mechanical clutch: disengaged, the rotor's mass/inertia leaves the shaft entirely. */
+    var clutchEngaged: Boolean = true
 
-    /** 0-100. Only depletes/matters once [lubricationSystemActive] is true. */
-    var lubricationPercent: Double = 100.0
-        private set
+    /** Emergency stop: dumps a large friction torque onto the shaft. */
+    var emergencyBrakeEngaged: Boolean = false
 
     fun addLubrication(amount: Double = 100.0) {
         lubricationPercent = (lubricationPercent + amount).coerceIn(0.0, 100.0)
+    }
+
+    fun repair() {
+        isDamaged = false
+        damageReason = FailureReason.NONE
+        lubricationPercent = 100.0
+        rotorWindingTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        boilerWaterMassKg = boiler.waterCapacityKg
+        boilerTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
+        angularVelocityRadPerS = 0.0
+        secondsAtZeroLubricationWhileRunning = 0.0
+        secondsDryFiring = 0.0
     }
 
     /** Fixed shaft stub every generation always has, independent of upgrades. */
@@ -72,21 +108,26 @@ class SteamEnginePlant(
     private val loadResistanceOhm = 2.0
 
     private val lubricationDepletionPercentPerSecond = 0.08
-    private val maxFrictionMultiplierAtZeroLubrication = 3.0
+    private val bearingSeizeThresholdSeconds = 90.0
+    private val dryFireGraceSeconds = 3.0
+    private val boilerRuptureMargin = 1.5
+    private val emergencyBrakeTorqueNm = 40.0
 
-    fun rotatingAssemblyMassKg(): Double =
-        flywheel.massKg + rotor.massKg + shaftMassKg
+    fun rotatingAssemblyMassKg(): Double = flywheel.massKg + rotor.massKg + shaftMassKg
 
     fun isStructurallyOverloaded(): Boolean =
         rotatingAssemblyMassKg() > frame.maxSupportedRotatingMassKg
 
     private fun totalMomentOfInertiaKgM2(): Double =
-        flywheel.momentOfInertiaKgM2 + rotor.momentOfInertiaKgM2 + shaftMomentOfInertiaKgM2
+        flywheel.momentOfInertiaKgM2 + shaftMomentOfInertiaKgM2 +
+            if (clutchEngaged) rotor.momentOfInertiaKgM2 else 0.0
 
-    private fun frictionMultiplier(): Double {
-        if (!lubricationSystemActive) return 1.0
-        val wear = (100.0 - lubricationPercent) / 100.0
-        return 1.0 + wear * (maxFrictionMultiplierAtZeroLubrication - 1.0)
+    private fun coulombFrictionCoefficient(omega: Double): Double {
+        val lubeQuality = (lubricationPercent / 100.0).coerceIn(0.05, 1.0)
+        val boundaryCoeff = frame.bearingFrictionCoeff * (1.0 + 1.6 * (1.0 - lubeQuality))
+        val filmCoeff = frame.bearingFrictionCoeff * (0.35 + 0.55 * (1.0 - lubeQuality))
+        val omegaTransition = max(1.0, 25.0 * lubeQuality)
+        return filmCoeff + (boundaryCoeff - filmCoeff) * exp(-omega / omegaTransition)
     }
 
     /**
@@ -100,78 +141,203 @@ class SteamEnginePlant(
     }
 
     private fun integrateSubstep(dt: Double) {
-        val overloaded = isStructurallyOverloaded()
-        val rawSaturationPa = saturationPressurePa(boilerTemperatureK)
-        val isVenting = rawSaturationPa > boiler.maxPressurePa
-        val boilerPressurePa = min(rawSaturationPa, boiler.maxPressurePa)
-        val throttle = throttleFraction.coerceIn(0.0, 1.0)
-
-        val drivingTorqueNm = if (overloaded) {
-            0.0
-        } else {
-            val cylinderPressurePa = boilerPressurePa * throttle
-            val netPistonPressurePa = max(0.0, cylinderPressurePa - piston.exhaustPressurePa)
-            val pistonForceN = netPistonPressurePa * piston.pistonAreaM2
-            pistonForceN * piston.crankRadiusM * PhysicsConstants.MEAN_TORQUE_FACTOR
+        if (isDamaged) {
+            coolDown(dt)
+            return
         }
 
-        val frictionMultiplier = frictionMultiplier()
-        val normalForceN = rotatingAssemblyMassKg() * PhysicsConstants.GRAVITY_M_PER_S2
-        val kineticFrictionTorqueNm = frame.bearingFrictionCoeff * normalForceN * frame.bearingRadiusM * frictionMultiplier
-        val staticFrictionTorqueNm = kineticFrictionTorqueNm * PhysicsConstants.STATIC_FRICTION_MULTIPLIER
+        val overloaded = isStructurallyOverloaded()
+        val rawSaturationPa = saturationPressurePa(boilerTemperatureK)
+        val boilerPressurePa = min(rawSaturationPa, boiler.maxPressurePa)
+        val hasWater = boilerWaterMassKg > 1e-6
+        val throttle = throttleFraction.coerceIn(0.0, 1.0)
+        val cutoff = cutoffFraction.coerceIn(0.05, 0.98)
+
+        val throttleAreaM2 = piston.maxValveAreaM2 * throttle
+        val maxValveMassFlowKgPerS = if (hasWater) {
+            compressibleMassFlowKgPerS(
+                areaM2 = throttleAreaM2,
+                dischargeCoefficient = 0.85,
+                upstreamPressurePa = boilerPressurePa,
+                upstreamTemperatureK = boilerTemperatureK,
+                downstreamPressurePa = piston.exhaustPressurePa,
+            )
+        } else {
+            0.0
+        }
 
         var omega = angularVelocityRadPerS
+        val revolutionsPerSecond = omega / (2.0 * PI)
+        val demandedMassFlowKgPerS = steamDensityKgPerM3(boilerPressurePa, boilerTemperatureK) *
+            piston.sweptVolumeM3 * revolutionsPerSecond
+        val supplyRatio = if (demandedMassFlowKgPerS > 1e-9) {
+            (maxValveMassFlowKgPerS / demandedMassFlowKgPerS).coerceIn(0.0, 1.0)
+        } else {
+            1.0
+        }
+        val admissionPressurePa = boilerPressurePa * supplyRatio
+        val meanEffectivePressurePa = admissionPressurePa * hyperbolicExpansionMeanPressureFactor(cutoff)
+
+        val drivingTorqueNm = if (overloaded || !hasWater) {
+            0.0
+        } else {
+            val netPistonPressurePa = max(0.0, meanEffectivePressurePa - piston.exhaustPressurePa)
+            netPistonPressurePa * piston.pistonAreaM2 * piston.crankRadiusM * PhysicsConstants.MEAN_TORQUE_FACTOR
+        }
+
+        val muCoulombAtRest = coulombFrictionCoefficient(0.0)
+        val normalForceN = rotatingAssemblyMassKg() * PhysicsConstants.GRAVITY_M_PER_S2
+        val staticFrictionTorqueNm =
+            muCoulombAtRest * normalForceN * frame.bearingRadiusM * PhysicsConstants.STATIC_FRICTION_MULTIPLIER
+
         omega = when {
             overloaded -> 0.0
             omega <= 1e-6 && drivingTorqueNm <= staticFrictionTorqueNm -> 0.0
             else -> {
-                val generatorLoadTorqueNm = if (generatorEngaged) {
-                    rotor.backEmfConstantVSPerRad * rotor.backEmfConstantVSPerRad * omega /
-                        (rotor.internalResistanceOhm + loadResistanceOhm)
+                val muCoulomb = coulombFrictionCoefficient(omega)
+                val kineticFrictionTorqueNm = muCoulomb * normalForceN * frame.bearingRadiusM
+                val lubeQuality = (lubricationPercent / 100.0).coerceIn(0.05, 1.0)
+                val viscousFrictionTorqueNm =
+                    frame.viscousFrictionCoeffNmSPerRad * (2.0 - lubeQuality) * omega
+                val brakeTorqueNm = if (emergencyBrakeEngaged) emergencyBrakeTorqueNm else 0.0
+
+                val generatorLoadTorqueNm = if (clutchEngaged) {
+                    val ke = rotor.backEmfConstantVSPerRad * excitationFraction.coerceIn(0.0, 1.5)
+                    ke * ke * omega / (rotor.internalResistanceOhm + loadResistanceOhm)
                 } else {
                     0.0
                 }
-                val viscousFrictionTorqueNm = frame.viscousFrictionCoeffNmSPerRad * omega * frictionMultiplier
-                val netTorqueNm =
-                    drivingTorqueNm - kineticFrictionTorqueNm - viscousFrictionTorqueNm - generatorLoadTorqueNm
+
+                val netTorqueNm = drivingTorqueNm - kineticFrictionTorqueNm - viscousFrictionTorqueNm -
+                    generatorLoadTorqueNm - brakeTorqueNm
                 val angularAccelerationRadPerS2 = netTorqueNm / totalMomentOfInertiaKgM2()
                 max(0.0, omega + angularAccelerationRadPerS2 * dt)
             }
         }
         angularVelocityRadPerS = omega
 
-        if (lubricationSystemActive && omega > 1.0) {
+        // --- Rotor winding thermal balance ---
+        val current = if (clutchEngaged) {
+            val ke = rotor.backEmfConstantVSPerRad * excitationFraction.coerceIn(0.0, 1.5)
+            ke * omega / (rotor.internalResistanceOhm + loadResistanceOhm)
+        } else {
+            0.0
+        }
+        val resistiveHeatingW = current * current * rotor.internalResistanceOhm
+        val overExcitation = max(0.0, excitationFraction - 1.0)
+        val fieldWindingHeatingW = if (clutchEngaged) (3.0 + rotor.level * 0.5) * overExcitation * overExcitation * 220.0 else 0.0
+        val windingCoolingW = (0.8 + 0.01 * omega) * (rotorWindingTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
+        val netWindingHeatW = resistiveHeatingW + fieldWindingHeatingW - windingCoolingW
+        rotorWindingTemperatureK = max(
+            PhysicsConstants.AMBIENT_TEMPERATURE_K,
+            rotorWindingTemperatureK + netWindingHeatW / rotor.thermalMassJPerK * dt,
+        )
+
+        // --- Lubrication wear ---
+        if (omega > 1.0) {
             lubricationPercent = (lubricationPercent - lubricationDepletionPercentPerSecond * dt).coerceIn(0.0, 100.0)
         }
+        secondsAtZeroLubricationWhileRunning = if (lubricationPercent <= 0.5 && omega > 1.0) {
+            secondsAtZeroLubricationWhileRunning + dt
+        } else {
+            0.0
+        }
 
-        val revolutionsPerSecond = omega / (2.0 * PI)
-        val steamMassFlowKgPerS = if (overloaded) {
+        // --- Boiler mass + energy balance ---
+        val cutoffLimitedDemandKgPerS = demandedMassFlowKgPerS * cutoff
+        val actualSteamMassFlowKgPerS = if (overloaded || !hasWater) {
             0.0
         } else {
-            val chargeDensity = steamDensityKgPerM3(boilerPressurePa, boilerTemperatureK)
-            chargeDensity * piston.sweptVolumeM3 * throttle * revolutionsPerSecond
+            min(cutoffLimitedDemandKgPerS, maxValveMassFlowKgPerS)
         }
-        val heatExtractedByPistonW = steamMassFlowKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
+        val heatExtractedByPistonW = actualSteamMassFlowKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
         val heatLossToEnvironmentW = boiler.insulationLossWPerK * (boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
-        val automaticSafetyValveLossW = if (isVenting) boiler.heatInputW * 0.2 else 0.0
-        val manualSafetyValveLossW = if (safetyValveOpen) boiler.heatInputW * 0.35 else 0.0
+
+        // The automatic relief valve is a real orifice too, sized to a fraction of what the
+        // boiler could generate at full heat input - enough to hold pressure under normal
+        // running (where the piston is also drawing steam), but not enough on its own to save
+        // a boiler that's fully stalled with the fuel valve left wide open. That's what the
+        // manual relief valve and fuel valve are for.
+        val maxBoilerGenerationKgPerS = boiler.heatInputW / PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
+        val isVenting = rawSaturationPa > boiler.maxPressurePa
+        val automaticVentMassFlowKgPerS = if (isVenting) 0.55 * maxBoilerGenerationKgPerS else 0.0
+        val automaticVentLossW = automaticVentMassFlowKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
+        val manualVentMassFlowKgPerS = if (safetyValveOpen) 0.7 * maxBoilerGenerationKgPerS else 0.0
+        val manualVentLossW = manualVentMassFlowKgPerS * PhysicsConstants.WATER_LATENT_HEAT_VAPORIZATION_J_PER_KG
+
+        // A real boiler is level-regulated: it never forces in more water than there's room
+        // for. Without this cap, an always-open feed valve on an already-full tank would
+        // keep cold-shocking the boiler for water that's actually just overflowing away.
+        val waterOutflowKgPerS = actualSteamMassFlowKgPerS + automaticVentMassFlowKgPerS + manualVentMassFlowKgPerS
+        val commandedFeedwaterFlowKgPerS = feedwaterValveFraction.coerceIn(0.0, 1.0) * boiler.feedwaterMaxFlowKgPerS
+        val headroomKg = max(0.0, boiler.waterCapacityKg - boilerWaterMassKg)
+        val maxUsefulFeedwaterFlowKgPerS = headroomKg / dt + waterOutflowKgPerS
+        val feedwaterMassFlowKgPerS = min(commandedFeedwaterFlowKgPerS, maxUsefulFeedwaterFlowKgPerS)
+        val coldFeedwaterHeatSinkW = feedwaterMassFlowKgPerS *
+            PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K * max(0.0, boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
 
         val effectiveHeatInputW = if (ignitionOn) boiler.heatInputW * fuelValveFraction.coerceIn(0.0, 1.0) else 0.0
         val netHeatW = effectiveHeatInputW - heatExtractedByPistonW - heatLossToEnvironmentW -
-            automaticSafetyValveLossW - manualSafetyValveLossW
-        val dTemperatureK = netHeatW / (boiler.waterMassKg * PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K) * dt
+            automaticVentLossW - manualVentLossW - coldFeedwaterHeatSinkW
+        val dTemperatureK = netHeatW / (max(0.005, boilerWaterMassKg) * PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K) * dt
         boilerTemperatureK = max(PhysicsConstants.AMBIENT_TEMPERATURE_K, boilerTemperatureK + dTemperatureK)
+
+        boilerWaterMassKg = (boilerWaterMassKg + (feedwaterMassFlowKgPerS - waterOutflowKgPerS) * dt)
+            .coerceIn(0.0, boiler.waterCapacityKg)
+
+        val lowWaterThresholdKg = 0.08 * boiler.waterCapacityKg
+        secondsDryFiring = if (boilerWaterMassKg <= lowWaterThresholdKg && ignitionOn && fuelValveFraction > 0.0) {
+            secondsDryFiring + dt
+        } else {
+            0.0
+        }
+
+        checkForDamage(rawSaturationPa, omega)
+    }
+
+    private fun checkForDamage(rawBoilerSaturationPa: Double, omega: Double) {
+        val tipSpeedMPerS = omega * flywheel.radiusM
+        when {
+            secondsDryFiring > dryFireGraceSeconds ->
+                triggerDamage(FailureReason.BOILER_DRY_FIRE)
+            rawBoilerSaturationPa > boiler.maxPressurePa * boilerRuptureMargin ->
+                triggerDamage(FailureReason.BOILER_RUPTURED)
+            tipSpeedMPerS > flywheel.maxSafeTipSpeedMPerS ->
+                triggerDamage(FailureReason.FLYWHEEL_BURST)
+            rotorWindingTemperatureK > rotor.maxWindingTemperatureK ->
+                triggerDamage(FailureReason.ROTOR_BURNOUT)
+            secondsAtZeroLubricationWhileRunning > bearingSeizeThresholdSeconds ->
+                triggerDamage(FailureReason.BEARING_SEIZED)
+        }
+    }
+
+    private fun triggerDamage(reason: FailureReason) {
+        isDamaged = true
+        damageReason = reason
+        angularVelocityRadPerS = 0.0
+    }
+
+    private fun coolDown(dt: Double) {
+        val heatLossToEnvironmentW = boiler.insulationLossWPerK * (boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
+        val dTemperatureK = -heatLossToEnvironmentW / (max(0.005, boilerWaterMassKg) * PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K) * dt
+        boilerTemperatureK = max(PhysicsConstants.AMBIENT_TEMPERATURE_K, boilerTemperatureK + dTemperatureK)
+        val windingCoolingW = 0.8 * (rotorWindingTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
+        rotorWindingTemperatureK = max(
+            PhysicsConstants.AMBIENT_TEMPERATURE_K,
+            rotorWindingTemperatureK - windingCoolingW / rotor.thermalMassJPerK * dt,
+        )
     }
 
     fun electricalPowerW(): Double {
-        if (!generatorEngaged) return 0.0
-        val current = rotor.backEmfConstantVSPerRad * angularVelocityRadPerS /
-            (rotor.internalResistanceOhm + loadResistanceOhm)
+        if (!clutchEngaged) return 0.0
+        val ke = rotor.backEmfConstantVSPerRad * excitationFraction.coerceIn(0.0, 1.5)
+        val current = ke * angularVelocityRadPerS / (rotor.internalResistanceOhm + loadResistanceOhm)
         return current * current * loadResistanceOhm
     }
 
     fun status(): PlantStatus {
         val failureReason = when {
+            isDamaged -> damageReason
             isStructurallyOverloaded() -> FailureReason.STRUCTURAL_OVERLOAD
             !ignitionOn -> FailureReason.IGNITION_OFF
             angularVelocityRadPerS <= 1e-6 -> FailureReason.STALLED_INSUFFICIENT_TORQUE
@@ -182,6 +348,7 @@ class SteamEnginePlant(
         return PlantStatus(
             boilerTemperatureK = boilerTemperatureK,
             boilerPressurePa = min(saturationPressurePa(boilerTemperatureK), boiler.maxPressurePa),
+            boilerWaterLevelFraction = (boilerWaterMassKg / boiler.waterCapacityKg).coerceIn(0.0, 1.0),
             angularVelocityRadPerS = angularVelocityRadPerS,
             rpm = angularVelocityRadPerS * 60.0 / (2.0 * PI),
             electricalPowerW = electricalW,
@@ -190,7 +357,9 @@ class SteamEnginePlant(
             rotatingAssemblyMassKg = rotatingAssemblyMassKg(),
             maxSupportedRotatingMassKg = frame.maxSupportedRotatingMassKg,
             lubricationPercent = lubricationPercent,
-            generatorEngaged = generatorEngaged,
+            rotorWindingTemperatureK = rotorWindingTemperatureK,
+            generatorEngaged = clutchEngaged,
+            isDamaged = isDamaged,
             failureReason = failureReason,
         )
     }

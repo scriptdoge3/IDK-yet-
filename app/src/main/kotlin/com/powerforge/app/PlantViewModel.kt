@@ -9,8 +9,6 @@ import com.powerforge.core.physics.GeneratorRotor
 import com.powerforge.core.physics.PartKind
 import com.powerforge.core.physics.PistonAssembly
 import com.powerforge.core.physics.SteamEnginePlant
-import com.powerforge.core.research.ControlUnlock
-import com.powerforge.core.research.ResearchEffect
 import com.powerforge.core.research.ResearchTree
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,10 +18,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 /**
- * Owns the physics simulation, the credit economy, and the research economy built
- * on top of it. The game clock runs faster than a real wall clock purely for pacing -
- * it does not change any of the underlying physics, just how much simulated time
- * elapses per real-world tick.
+ * Owns the physics simulation, the credit economy (paid for oil and repairs), and
+ * the research economy (the only way parts actually level up). The game clock runs
+ * faster than a real wall clock purely for pacing - it does not change any of the
+ * underlying physics, just how much simulated time elapses per real-world tick.
  */
 class PlantViewModel : ViewModel() {
 
@@ -33,6 +31,9 @@ class PlantViewModel : ViewModel() {
         private const val CREDITS_PER_JOULE = 1.0
         private const val BASE_RESEARCH_POINTS_PER_SECOND = 0.3
         private const val RESEARCH_POINTS_PER_WATT_SECOND = 0.01
+        private const val OIL_COST_CREDITS = 25L
+        private const val BASE_REPAIR_COST_CREDITS = 150L
+        private const val REPAIR_COST_PER_LEVEL_CREDITS = 35L
     }
 
     private val plant = SteamEnginePlant()
@@ -62,19 +63,6 @@ class PlantViewModel : ViewModel() {
         }
     }
 
-    fun upgrade(kind: PartKind) {
-        val currentLevel = levelOf(kind)
-        val maxLevel = ResearchTree.maxLevelFor(kind, researchedNodeIds)
-        if (currentLevel >= maxLevel) return
-
-        val cost = costOf(kind)
-        if (credits < cost) return
-        credits -= cost
-        bumpLevel(kind)
-
-        _uiState.update { buildUiState() }
-    }
-
     fun research(nodeId: String) {
         if (!ResearchTree.canResearch(nodeId, researchedNodeIds)) return
         val node = ResearchTree.byId[nodeId] ?: return
@@ -82,43 +70,87 @@ class PlantViewModel : ViewModel() {
 
         researchPoints -= node.costRp
         researchedNodeIds = researchedNodeIds + nodeId
+        setPartLevel(node.partKind, node.toLevel)
 
-        val effect = node.effect
-        if (effect is ResearchEffect.UnlockControl && effect.control == ControlUnlock.LUBRICATION) {
-            plant.lubricationSystemActive = true
-        }
+        _uiState.update { buildUiState() }
+    }
 
+    fun repair() {
+        val cost = repairCostCredits()
+        if (credits < cost || !plant.isDamaged) return
+        credits -= cost
+        plant.repair()
+        _uiState.update { buildUiState() }
+    }
+
+    fun addOil() {
+        if (credits < OIL_COST_CREDITS) return
+        credits -= OIL_COST_CREDITS
+        plant.addLubrication()
         _uiState.update { buildUiState() }
     }
 
     fun setThrottle(fraction: Double) {
         plant.throttleFraction = fraction.coerceIn(0.0, 1.0)
-        _uiState.update { it.copy(controls = it.controls.copy(throttleFraction = plant.throttleFraction)) }
+        pushControls()
+    }
+
+    fun setCutoff(fraction: Double) {
+        plant.cutoffFraction = fraction.coerceIn(0.05, 0.98)
+        pushControls()
     }
 
     fun setFuelValve(fraction: Double) {
         plant.fuelValveFraction = fraction.coerceIn(0.0, 1.0)
-        _uiState.update { it.copy(controls = it.controls.copy(fuelValveFraction = plant.fuelValveFraction)) }
+        pushControls()
     }
 
     fun setIgnition(on: Boolean) {
         plant.ignitionOn = on
-        _uiState.update { it.copy(controls = it.controls.copy(ignitionOn = on)) }
+        pushControls()
     }
 
-    fun setGeneratorEngaged(engaged: Boolean) {
-        plant.generatorEngaged = engaged
-        _uiState.update { it.copy(controls = it.controls.copy(generatorEngaged = engaged)) }
+    fun setFeedwaterValve(fraction: Double) {
+        plant.feedwaterValveFraction = fraction.coerceIn(0.0, 1.0)
+        pushControls()
     }
 
     fun setSafetyValveOpen(open: Boolean) {
         plant.safetyValveOpen = open
-        _uiState.update { it.copy(controls = it.controls.copy(safetyValveOpen = open)) }
+        pushControls()
     }
 
-    fun addLubrication() {
-        plant.addLubrication()
-        _uiState.update { it.copy(controls = it.controls.copy(lubricationPercent = plant.lubricationPercent)) }
+    fun setExcitation(fraction: Double) {
+        plant.excitationFraction = fraction.coerceIn(0.0, 1.5)
+        pushControls()
+    }
+
+    fun setClutchEngaged(engaged: Boolean) {
+        plant.clutchEngaged = engaged
+        pushControls()
+    }
+
+    fun setEmergencyBrake(engaged: Boolean) {
+        plant.emergencyBrakeEngaged = engaged
+        pushControls()
+    }
+
+    private fun pushControls() {
+        _uiState.update {
+            it.copy(
+                controls = it.controls.copy(
+                    throttleFraction = plant.throttleFraction,
+                    cutoffFraction = plant.cutoffFraction,
+                    fuelValveFraction = plant.fuelValveFraction,
+                    ignitionOn = plant.ignitionOn,
+                    feedwaterValveFraction = plant.feedwaterValveFraction,
+                    safetyValveOpen = plant.safetyValveOpen,
+                    excitationFraction = plant.excitationFraction,
+                    clutchEngaged = plant.clutchEngaged,
+                    emergencyBrakeEngaged = plant.emergencyBrakeEngaged,
+                ),
+            )
+        }
     }
 
     private fun levelOf(kind: PartKind): Int = when (kind) {
@@ -129,23 +161,26 @@ class PlantViewModel : ViewModel() {
         PartKind.FRAME -> plant.frame.level
     }
 
-    private fun costOf(kind: PartKind): Long = when (kind) {
-        PartKind.BOILER -> plant.boiler.upgradeCost()
-        PartKind.PISTON -> plant.piston.upgradeCost()
-        PartKind.FLYWHEEL -> plant.flywheel.upgradeCost()
-        PartKind.ROTOR -> plant.rotor.upgradeCost()
-        PartKind.FRAME -> plant.frame.upgradeCost()
-    }
-
-    private fun bumpLevel(kind: PartKind) {
+    private fun setPartLevel(kind: PartKind, level: Int) {
         when (kind) {
-            PartKind.BOILER -> plant.boiler = Boiler(plant.boiler.level + 1)
-            PartKind.PISTON -> plant.piston = PistonAssembly(plant.piston.level + 1)
-            PartKind.FLYWHEEL -> plant.flywheel = Flywheel(plant.flywheel.level + 1)
-            PartKind.ROTOR -> plant.rotor = GeneratorRotor(plant.rotor.level + 1)
-            PartKind.FRAME -> plant.frame = Frame(plant.frame.level + 1)
+            PartKind.BOILER -> plant.boiler = Boiler(level)
+            PartKind.PISTON -> plant.piston = PistonAssembly(level)
+            PartKind.FLYWHEEL -> plant.flywheel = Flywheel(level)
+            PartKind.ROTOR -> plant.rotor = GeneratorRotor(level)
+            PartKind.FRAME -> plant.frame = Frame(level)
         }
     }
+
+    private fun partLabel(kind: PartKind): String = when (kind) {
+        PartKind.BOILER -> "Boiler"
+        PartKind.PISTON -> "Piston & Crank"
+        PartKind.FLYWHEEL -> "Flywheel"
+        PartKind.ROTOR -> "Generator Rotor"
+        PartKind.FRAME -> "Frame & Bearings"
+    }
+
+    private fun repairCostCredits(): Long =
+        BASE_REPAIR_COST_CREDITS + PartKind.entries.sumOf { levelOf(it).toLong() } * REPAIR_COST_PER_LEVEL_CREDITS
 
     private fun buildUiState(): PlantUiState {
         val status = plant.status()
@@ -154,26 +189,29 @@ class PlantViewModel : ViewModel() {
             researchPoints = researchPoints,
             boilerTemperatureK = status.boilerTemperatureK,
             boilerPressurePa = status.boilerPressurePa,
+            boilerWaterLevelFraction = status.boilerWaterLevelFraction,
             rpm = status.rpm,
             electricalPowerW = status.electricalPowerW,
             heatInputW = status.heatInputW,
             overallEfficiency = status.overallEfficiency,
             rotatingAssemblyMassKg = status.rotatingAssemblyMassKg,
             maxSupportedRotatingMassKg = status.maxSupportedRotatingMassKg,
+            rotorWindingTemperatureK = status.rotorWindingTemperatureK,
+            isDamaged = status.isDamaged,
+            repairCostCredits = repairCostCredits(),
             failureReason = status.failureReason,
             parts = buildPartsUi(),
             research = buildResearchUi(),
             controls = ControlsUiState(
-                throttleUnlocked = ResearchTree.isControlUnlocked(ControlUnlock.THROTTLE, researchedNodeIds),
                 throttleFraction = plant.throttleFraction,
-                ignitionUnlocked = ResearchTree.isControlUnlocked(ControlUnlock.IGNITION, researchedNodeIds),
-                ignitionOn = plant.ignitionOn,
+                cutoffFraction = plant.cutoffFraction,
                 fuelValveFraction = plant.fuelValveFraction,
-                generatorClutchUnlocked = ResearchTree.isControlUnlocked(ControlUnlock.GENERATOR_CLUTCH, researchedNodeIds),
-                generatorEngaged = plant.generatorEngaged,
-                safetyValveUnlocked = ResearchTree.isControlUnlocked(ControlUnlock.SAFETY_VALVE, researchedNodeIds),
+                ignitionOn = plant.ignitionOn,
+                feedwaterValveFraction = plant.feedwaterValveFraction,
                 safetyValveOpen = plant.safetyValveOpen,
-                lubricationUnlocked = ResearchTree.isControlUnlocked(ControlUnlock.LUBRICATION, researchedNodeIds),
+                excitationFraction = plant.excitationFraction,
+                clutchEngaged = plant.clutchEngaged,
+                emergencyBrakeEngaged = plant.emergencyBrakeEngaged,
                 lubricationPercent = status.lubricationPercent,
             ),
         )
@@ -182,56 +220,50 @@ class PlantViewModel : ViewModel() {
     private fun buildPartsUi(): List<PartUiState> = listOf(
         PartUiState(
             kind = PartKind.BOILER,
-            label = "Boiler",
+            label = partLabel(PartKind.BOILER),
             level = plant.boiler.level,
-            maxLevel = ResearchTree.maxLevelFor(PartKind.BOILER, researchedNodeIds),
-            upgradeCost = plant.boiler.upgradeCost(),
             summary = "${plant.boiler.heatInputW.toInt()} W heat · ${(plant.boiler.maxPressurePa / 1000).toInt()} kPa max",
         ),
         PartUiState(
             kind = PartKind.PISTON,
-            label = "Piston & Crank",
+            label = partLabel(PartKind.PISTON),
             level = plant.piston.level,
-            maxLevel = ResearchTree.maxLevelFor(PartKind.PISTON, researchedNodeIds),
-            upgradeCost = plant.piston.upgradeCost(),
             summary = "${(plant.piston.boreRadiusM * 2000).toInt()} mm bore · ${(plant.piston.crankRadiusM * 2000).toInt()} mm stroke",
         ),
         PartUiState(
             kind = PartKind.FLYWHEEL,
-            label = "Flywheel",
+            label = partLabel(PartKind.FLYWHEEL),
             level = plant.flywheel.level,
-            maxLevel = ResearchTree.maxLevelFor(PartKind.FLYWHEEL, researchedNodeIds),
-            upgradeCost = plant.flywheel.upgradeCost(),
             summary = "${"%.2f".format(plant.flywheel.massKg)} kg · ${(plant.flywheel.radiusM * 100).toInt()} cm radius",
         ),
         PartUiState(
             kind = PartKind.ROTOR,
-            label = "Generator Rotor",
+            label = partLabel(PartKind.ROTOR),
             level = plant.rotor.level,
-            maxLevel = ResearchTree.maxLevelFor(PartKind.ROTOR, researchedNodeIds),
-            upgradeCost = plant.rotor.upgradeCost(),
             summary = "${"%.2f".format(plant.rotor.massKg)} kg · ke=${"%.2f".format(plant.rotor.backEmfConstantVSPerRad)}",
         ),
         PartUiState(
             kind = PartKind.FRAME,
-            label = "Frame & Bearings",
+            label = partLabel(PartKind.FRAME),
             level = plant.frame.level,
-            maxLevel = ResearchTree.maxLevelFor(PartKind.FRAME, researchedNodeIds),
-            upgradeCost = plant.frame.upgradeCost(),
             summary = "supports ${"%.2f".format(plant.frame.maxSupportedRotatingMassKg)} kg rotating",
         ),
     )
 
-    private fun buildResearchUi(): List<ResearchNodeUiState> = ResearchTree.nodes.map { node ->
+    private fun buildResearchUi(): List<ResearchNodeUiState> = PartKind.entries.map { kind ->
+        val currentLevel = levelOf(kind)
+        val nextId = ResearchTree.nextNodeIdFor(kind, currentLevel)
+        val nextNode = nextId?.let { ResearchTree.byId[it] }
         ResearchNodeUiState(
-            id = node.id,
-            branch = node.branch,
-            label = node.label,
-            description = node.description,
-            costRp = node.costRp,
-            prerequisiteLabels = node.prerequisiteIds.mapNotNull { ResearchTree.byId[it]?.label },
-            isResearched = node.id in researchedNodeIds,
-            isAvailable = ResearchTree.canResearch(node.id, researchedNodeIds),
+            partKind = kind,
+            label = partLabel(kind),
+            currentLevel = currentLevel,
+            maxLevel = ResearchTree.MAX_LEVEL,
+            nextNodeId = nextId,
+            nextLabel = nextNode?.label ?: "",
+            nextDescription = nextNode?.description ?: "Fully researched.",
+            nextCostRp = nextNode?.costRp ?: 0L,
+            isMaxed = nextNode == null,
         )
     }
 }
