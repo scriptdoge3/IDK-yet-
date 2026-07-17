@@ -50,6 +50,7 @@ data class PlantStatus(
     val circuitBreakerClosed: Boolean,
     val drainCocksOpen: Boolean,
     val blowdownValveOpen: Boolean,
+    val starterMotorEngaged: Boolean,
     val flameActive: Boolean,
     /** Real bond tension in the flywheel rim's lattice vs. the real tension that snaps it - 1.0 is burst, not a chosen number. */
     val flywheelStressFraction: Double,

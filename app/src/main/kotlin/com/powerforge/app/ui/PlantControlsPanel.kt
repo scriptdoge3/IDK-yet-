@@ -42,6 +42,7 @@ fun PlantControlsPanel(
     onCircuitBreakerChange: (Boolean) -> Unit,
     onDrainCocksChange: (Boolean) -> Unit,
     onBlowdownValveChange: (Boolean) -> Unit,
+    onStarterMotorChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Card(
@@ -95,6 +96,7 @@ fun PlantControlsPanel(
             HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp))
             SectionLabel("Drivetrain & electrical")
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                ToggleLever("Start motor", controls.starterMotorEngaged, onStarterMotorChange)
                 ToggleLever("Clutch", controls.clutchEngaged, onClutchChange)
                 ToggleLever("Breaker", controls.circuitBreakerClosed, onCircuitBreakerChange)
                 ToggleLever("E-brake", controls.emergencyBrakeEngaged, onEmergencyBrakeChange, danger = true)

@@ -70,6 +70,23 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
         const val TARGET_PARTICLE_COUNT = 160.0
 
         /**
+         * Effective internal (rotational + vibrational) degrees of freedom of a real
+         * water-vapour molecule, on top of the 2 translational DOF this 2D sim tracks
+         * explicitly. Real steam's ratio of specific heats is gamma ~ 1.3 - the very same
+         * value the valve-flow equation already uses ([STEAM_SPECIFIC_HEAT_RATIO]); for an
+         * ideal gas gamma = (f+2)/f where f is the TOTAL active DOF, so f = 2/(gamma-1) and
+         * the internal part is f - 2 (~4.67). A gas with only its 2 translational DOF would
+         * instead behave as gamma = (2+2)/2 = 2.0 - wrong for steam, and it would cool and
+         * lose pressure far too fast on the expansion stroke. Storing energy in these
+         * internal modes, and letting it flow back into translation as the charge cools
+         * while it expands, is exactly what gives the cylinder steam its real gamma instead
+         * of a monatomic-like 2.0, and it makes the cylinder consistent with the gamma the
+         * valve upstream of it already assumes. Real; not a tuning constant - it's fixed
+         * entirely by steam's measured gamma.
+         */
+        val STEAM_INTERNAL_DOF = 2.0 / (STEAM_SPECIFIC_HEAT_RATIO - 1.0) - 2.0
+
+        /**
          * A safety bound on the analytic per-particle ballistic solver, not a physics
          * value: with real particle speeds and a real chamber this small, a particle
          * essentially never needs this many wall/piston bounces resolved in one substep;
@@ -104,6 +121,20 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
      * would.
      */
     private var netFlowAccumulatorKg = 0.0
+
+    /**
+     * The real thermal energy currently held in the charge's internal (rotational +
+     * vibrational) molecular modes - see [STEAM_INTERNAL_DOF]. Kept as a running
+     * reservoir (in the same Fn-scaled joules as the translational kinetic energy) and
+     * re-equilibrated with translation every substep: energy that piston work pulls out
+     * of translation on the expansion stroke is partly drawn back from here, which is
+     * exactly what makes the charge cool along steam's real gamma instead of a
+     * monatomic-like 2.0. Instantaneous translational<->internal equilibrium is a valid
+     * approximation here for the same reason the collision model already relies on: real
+     * molecular collisions re-thermalize this gas astronomically faster than anything
+     * mechanical in the simulation changes.
+     */
+    private var internalEnergyJ = 0.0
 
     /**
      * Running estimate of the fastest relative approach speed seen; NTC needs this to
@@ -186,6 +217,7 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
     fun reset() {
         activeCount = 0
         netFlowAccumulatorKg = 0.0
+        internalEnergyJ = 0.0
         lastPressurePa = PhysicsConstants.ATMOSPHERIC_PRESSURE_PA
         lastTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
         relativeSpeedMaxEstimateMPerS =
@@ -262,6 +294,13 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
             // this bulk drift keeps driving the piston even as collisions isotropize the
             // random thermal spread around it every substep.
             val bulkInwardVelocityMPerS = massFlowInKgPerS / max(1e-6, sourceDensityKgPerM3 * pistonAreaM2)
+            // The internal (rotational/vibrational) energy a freshly-admitted representative
+            // particle of steam carries in with it at the source temperature - the internal
+            // half of its real thermal energy, alongside the translational half its sampled
+            // velocities already carry. See [internalEnergyJ]/[STEAM_INTERNAL_DOF].
+            val realMoleculesPerParticle = particleMassKg / WATER_MOLECULE_MASS_KG
+            val internalPerInjectedParticleJ =
+                realMoleculesPerParticle * (STEAM_INTERNAL_DOF / 2.0) * BOLTZMANN_J_PER_K * sourceTemperatureK
             while (netFlowAccumulatorKg >= particleMassKg) {
                 netFlowAccumulatorKg -= particleMassKg
                 particlesInjectedThisCall++
@@ -275,13 +314,22 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
                 // forever - unable to reflect a boiler that goes on to reach full
                 // pressure and temperature - because nothing else in this simulation ever
                 // touches an existing particle's speed except a moving piston wall.
-                val i = if (activeCount < maxParticles) activeCount++ else rng.nextInt(activeCount)
+                val i = if (activeCount < maxParticles) {
+                    activeCount++
+                } else {
+                    // Resampling an existing particle to fresh steam: its old internal
+                    // energy leaves with the stale gas it's displacing, so drop that
+                    // particle's share of the reservoir before the new puff adds its own.
+                    internalEnergyJ -= internalEnergyJ / activeCount
+                    rng.nextInt(activeCount)
+                }
                 // Born just inside the fixed (valve) wall, moving inward - a fresh puff of
                 // admitted steam, not smeared uniformly through gas that hasn't arrived yet.
                 x[i] = rng.nextDouble() * max(1e-7, pistonPositionM * 0.02)
                 y[i] = (rng.nextDouble() * 2.0 - 1.0) * halfWidthM
                 vx[i] = gaussianSample() * thermalSpeedMPerS + bulkInwardVelocityMPerS
                 vy[i] = gaussianSample() * thermalSpeedMPerS
+                internalEnergyJ += internalPerInjectedParticleJ
             }
         }
 
@@ -301,8 +349,12 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
             val last = activeCount - 1
             x[victim] = x[last]; y[victim] = y[last]
             vx[victim] = vx[last]; vy[victim] = vy[last]
+            // The vented particle carries its share of the internal-mode energy back out
+            // through the valve too, not just its translational kinetic energy.
+            internalEnergyJ -= internalEnergyJ / activeCount
             activeCount--
         }
+        if (activeCount == 0) internalEnergyJ = 0.0
 
         lastActualMassFlowKgPerS = (particlesInjectedThisCall - particlesEvictedThisCall) * particleMassKg / dt
 
@@ -412,6 +464,49 @@ class KineticCylinderGas(private val maxParticles: Int = 200) {
                     vy[p] = gaussianSample() * thermalSpeedMPerS
                 }
             }
+        }
+
+        // Real internal (rotational/vibrational) molecular energy in fast equilibrium
+        // with translation. Everything above this changed only the translational
+        // velocities (piston work, the wall exchange, injection); this settles the
+        // internal reservoir back to equipartition with them, moving energy between the
+        // two so the charge carries steam's real total heat capacity and cools along its
+        // real gamma - not a monatomic-like 2.0 - as the piston pulls translational
+        // energy out on the expansion stroke. Total thermal energy (translational +
+        // internal) is conserved by the move; only how it's split shifts. Instantaneous
+        // equilibrium is valid here for the same reason the collision model already
+        // relies on: real molecular collisions re-thermalize this gas far faster than
+        // anything mechanical changes. See [internalEnergyJ]/[STEAM_INTERNAL_DOF].
+        if (activeCount > 0) {
+            var translationalEnergyJ = 0.0
+            for (p in 0 until activeCount) {
+                translationalEnergyJ += vx[p] * vx[p] + vy[p] * vy[p]
+            }
+            translationalEnergyJ *= 0.5 * particleMassKg
+            val totalThermalEnergyJ = translationalEnergyJ + internalEnergyJ
+            // Equipartition: translation holds 2 of the (2 + internal) total DOF.
+            val translationalTargetJ = totalThermalEnergyJ * 2.0 / (2.0 + STEAM_INTERNAL_DOF)
+            if (translationalEnergyJ > 1e-30) {
+                val velocityScale = sqrt(translationalTargetJ / translationalEnergyJ)
+                for (p in 0 until activeCount) {
+                    vx[p] *= velocityScale
+                    vy[p] *= velocityScale
+                }
+            } else if (translationalTargetJ > 1e-30) {
+                // Translation collapsed to zero but internal energy remains - reseed at
+                // the temperature that target implies, since scaling zero stays zero.
+                val realMoleculesPerParticle = particleMassKg / WATER_MOLECULE_MASS_KG
+                val impliedTemperatureK =
+                    (translationalTargetJ / activeCount) / (realMoleculesPerParticle * BOLTZMANN_J_PER_K)
+                val thermalSpeedMPerS = sqrt(BOLTZMANN_J_PER_K * impliedTemperatureK / WATER_MOLECULE_MASS_KG)
+                for (p in 0 until activeCount) {
+                    vx[p] = gaussianSample() * thermalSpeedMPerS
+                    vy[p] = gaussianSample() * thermalSpeedMPerS
+                }
+            }
+            internalEnergyJ = totalThermalEnergyJ - translationalTargetJ
+        } else {
+            internalEnergyJ = 0.0
         }
 
         // Temperature is per-molecule (intensive), so it has to come from the real

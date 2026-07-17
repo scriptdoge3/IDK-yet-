@@ -6,12 +6,41 @@ import org.junit.Test
 
 class SteamEnginePlantTest {
 
-    private fun runToSteadyState(plant: SteamEnginePlant, totalSeconds: Double = 180.0): PlantStatus {
+    /**
+     * Runs the plant the way a real operator cold-starts one: raise steam with the
+     * engine parked, then, once there's genuinely enough pressure, engage the electric
+     * starting motor to crank it past dead centre until steam admission takes over -
+     * then switch the starter off and let it settle on steam alone. A real single-
+     * cylinder engine can stop on a dead centre and cannot restart itself from there;
+     * the starter is exactly what a real plant uses to get it turning again, so every
+     * "does it run" check here goes through that same real starting procedure. The final
+     * reading is always taken with the starter OFF and after a settle, so a plant that
+     * only turns because it's being cranked correctly reads as stalled.
+     */
+    private fun runToSteadyState(plant: SteamEnginePlant, totalSeconds: Double = 480.0): PlantStatus {
         val tick = 0.5
+        val steamUpThresholdPa = 0.5 * plant.boiler.maxPressurePa
+        val settleSeconds = 30.0
         var elapsed = 0.0
+        var crankEndsAt = -1.0
         while (elapsed < totalSeconds) {
+            val st = plant.status()
+            // Crank (or re-crank) whenever the engine is stopped but there's steam up to
+            // run on - and never so late that it wouldn't have time to settle steam-only.
+            if (elapsed >= crankEndsAt && st.rpm < 5.0 &&
+                st.boilerPressurePa >= steamUpThresholdPa && elapsed < totalSeconds - settleSeconds - 5.0
+            ) {
+                crankEndsAt = elapsed + 15.0
+            }
+            plant.starterMotorEngaged = elapsed < crankEndsAt
             plant.step(tick)
             elapsed += tick
+        }
+        plant.starterMotorEngaged = false
+        var settle = 0.0
+        while (settle < settleSeconds) {
+            plant.step(tick)
+            settle += tick
         }
         return plant.status()
     }
@@ -114,7 +143,7 @@ class SteamEnginePlantTest {
             rotor = GeneratorRotor(6),
             frame = Frame(10),
         )
-        val status = runToSteadyState(plant, totalSeconds = 240.0)
+        val status = runToSteadyState(plant, totalSeconds = 480.0)
 
         println("frame-upgraded heavy build: mass=${status.rotatingAssemblyMassKg} failure=${status.failureReason} W=${status.electricalPowerW}")
 
@@ -309,18 +338,30 @@ class SteamEnginePlantTest {
     }
 
     @Test
-    fun `leaving the burner on full while stalled overloads and ruptures the boiler`() {
+    fun `a stalled boiler on full fire with no feedwater relief overpressures and ruptures`() {
+        // Overloaded so the engine can't run and draw steam off (that path is stalled),
+        // burner wide open, and - crucially - the feedwater shut. A real automatic relief
+        // valve plus the cold-feedwater makeup it relies on will actually hold even a
+        // stalled, full-fire boiler at a safe pressure (that's exactly what they're for,
+        // and this engine now models it): with feedwater on, this same boiler just sits
+        // near its rated pressure and never bursts. Take away the cold-feedwater heat sink,
+        // though - the operator not keeping water up while the fire roars - and the relief
+        // valve alone can't carry the whole firing rate, so pressure climbs past the
+        // shell's real burst margin and it lets go. It ruptures from overpressure while
+        // there's still plenty of water in it (well before any dry-firing), a genuine
+        // overpressure burst, not a dry-fire.
         val plant = SteamEnginePlant(
             boiler = Boiler(15),
             flywheel = Flywheel(8),
             rotor = GeneratorRotor(8),
             frame = Frame(1),
-        )
+        ).apply { feedwaterValveFraction = 0.0 }
         val status = runToSteadyState(plant, totalSeconds = 3000.0)
 
-        println("rupture test: P=${status.boilerPressurePa} failure=${status.failureReason}")
+        println("rupture test: P=${status.boilerPressurePa} water=${status.boilerWaterLevelFraction} failure=${status.failureReason}")
         assertEquals(FailureReason.BOILER_RUPTURED, status.failureReason)
         assertTrue(plant.isDamaged)
+        assertTrue("should burst from overpressure with water still in it, not dry-fire", status.boilerWaterLevelFraction > 0.15)
     }
 
     @Test
@@ -340,7 +381,7 @@ class SteamEnginePlantTest {
         assertTrue(!plant.isDamaged)
         // A repaired plant is restarting cold, same as a fresh one - needs the same
         // real warm-up time to rebuild boiler pressure, not an instant restart.
-        val status = runToSteadyState(plant, totalSeconds = 400.0)
+        val status = runToSteadyState(plant, totalSeconds = 480.0)
         assertEquals(FailureReason.NONE, status.failureReason)
         assertTrue(status.electricalPowerW > 0.0)
     }

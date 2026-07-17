@@ -160,6 +160,11 @@ class PlantViewModel : ViewModel() {
         pushControls()
     }
 
+    fun setStarterMotorEngaged(engaged: Boolean) {
+        plant.starterMotorEngaged = engaged
+        pushControls()
+    }
+
     private fun pushControls() {
         _uiState.update {
             it.copy(
@@ -179,6 +184,7 @@ class PlantViewModel : ViewModel() {
                     circuitBreakerClosed = plant.circuitBreakerClosed,
                     drainCocksOpen = plant.drainCocksOpen,
                     blowdownValveOpen = plant.blowdownValveOpen,
+                    starterMotorEngaged = plant.starterMotorEngaged,
                 ),
             )
         }
@@ -259,6 +265,7 @@ class PlantViewModel : ViewModel() {
                 circuitBreakerClosed = plant.circuitBreakerClosed,
                 drainCocksOpen = plant.drainCocksOpen,
                 blowdownValveOpen = plant.blowdownValveOpen,
+                starterMotorEngaged = plant.starterMotorEngaged,
                 lubricationPercent = status.lubricationPercent,
                 boilerScalePercent = status.boilerScalePercent,
                 throttleMaxValveAreaM2 = plant.piston.maxValveAreaM2,

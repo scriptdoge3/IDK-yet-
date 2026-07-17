@@ -41,6 +41,7 @@ data class ControlsUiState(
     val circuitBreakerClosed: Boolean = true,
     val drainCocksOpen: Boolean = false,
     val blowdownValveOpen: Boolean = false,
+    val starterMotorEngaged: Boolean = false,
     val lubricationPercent: Double = 100.0,
     val boilerScalePercent: Double = 0.0,
     /** The throttle valve's real fully-open throat area - scales with the piston's real bore. */

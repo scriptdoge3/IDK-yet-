@@ -138,6 +138,7 @@ fun PlantScreen(viewModel: PlantViewModel = viewModel(), modifier: Modifier = Mo
                         onCircuitBreakerChange = viewModel::setCircuitBreakerClosed,
                         onDrainCocksChange = viewModel::setDrainCocksOpen,
                         onBlowdownValveChange = viewModel::setBlowdownValveOpen,
+                        onStarterMotorChange = viewModel::setStarterMotorEngaged,
                     )
                 }
                 item {

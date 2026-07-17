@@ -168,6 +168,7 @@ class SteamEnginePlant(
     private val circuitBreakerSwitch = LatchedSwitch(true, BREAKER_LATENCY_SECONDS)
     private val drainCocksSwitch = LatchedSwitch(false, DRAIN_COCKS_LATENCY_SECONDS)
     private val blowdownValveSwitch = LatchedSwitch(false, BLOWDOWN_LATENCY_SECONDS)
+    private val starterMotorSwitch = LatchedSwitch(false, STARTER_LATENCY_SECONDS)
 
     /** Master ignition. When off, no heat is produced regardless of the fuel valve. */
     var ignitionOn: Boolean
@@ -203,6 +204,19 @@ class SteamEnginePlant(
     var blowdownValveOpen: Boolean
         get() = blowdownValveSwitch.commanded
         set(value) { blowdownValveSwitch.commanded = value }
+
+    /**
+     * Electric starting motor. A real steam engine can stop on a dead centre - a crank
+     * position where the trapped steam has already expanded and can no longer push, and
+     * from which admission alone can't restart it - so it's turned over by an auxiliary
+     * electric motor (a starter / barring motor) until it's past the dead centre and up
+     * to a speed where steam admission takes over on its own. Engage it to crank a cold
+     * or stalled engine; once it's running under steam, switch it off. It contributes no
+     * torque once the engine has outrun it (see [starterMotorTorqueNm]).
+     */
+    var starterMotorEngaged: Boolean
+        get() = starterMotorSwitch.commanded
+        set(value) { starterMotorSwitch.commanded = value }
 
     // --- Effective values: what the physics actually sees, lagging the commanded ones ---
 
@@ -307,6 +321,20 @@ class SteamEnginePlant(
         const val BREAKER_LATENCY_SECONDS = 0.15
         const val DRAIN_COCKS_LATENCY_SECONDS = 0.3
         const val BLOWDOWN_LATENCY_SECONDS = 0.3
+        const val STARTER_LATENCY_SECONDS = 0.2
+
+        // Electric starting motor, modeled as a real DC motor's linear torque-speed
+        // curve: full (stall) torque at rest, falling linearly to zero at its no-load
+        // speed, so it cranks hard from a dead stop and naturally stops contributing once
+        // the engine has outrun it. The stall torque is expressed as an angular
+        // acceleration of the whole drivetrain (torque = accel * total inertia), so the
+        // same starter cranks every engine size at a similar rate - exactly how a real
+        // starter is sized to its own engine, not one fixed torque that would be too weak
+        // for a big flywheel and violent on a small one. The no-load speed is a modest
+        // few hundred RPM: enough to carry the engine past dead centre and into a couple
+        // of steam cycles, then it hands off to the steam and freewheels.
+        const val STARTER_STALL_ANGULAR_ACCEL_RAD_PER_S2 = 45.0
+        const val STARTER_NO_LOAD_SPEED_RAD_PER_S = 32.0
     }
 
     fun rotatingAssemblyMassKg(): Double = flywheel.massKg + rotor.massKg + shaftMassKg
@@ -317,6 +345,24 @@ class SteamEnginePlant(
     private fun totalMomentOfInertiaKgM2(): Double =
         flywheel.momentOfInertiaKgM2 + shaftMomentOfInertiaKgM2 +
             if (clutchSwitch.effective) rotor.momentOfInertiaKgM2 else 0.0
+
+    /**
+     * Torque the electric starting motor delivers to the shaft at the current speed,
+     * following a real DC motor's linear torque-speed curve: maximum (stall) torque at
+     * rest, falling to zero at [STARTER_STALL_ANGULAR_ACCEL_RAD_PER_S2]'s companion
+     * no-load speed, past which it freewheels and adds nothing (the engine has outrun
+     * it). Zero unless the starter is actually engaged. The stall torque is sized to the
+     * drivetrain's own inertia so a given starter cranks its engine at a consistent rate
+     * regardless of engine size (see the companion constants). This only cranks the
+     * engine over - it can't keep it running: a boiler without enough steam to sustain
+     * the engine on its own will just coast back down and stop once the starter is off,
+     * exactly like a real engine that hasn't got its steam up yet.
+     */
+    private fun starterMotorTorqueNm(omega: Double): Double {
+        if (!starterMotorSwitch.effective || omega >= STARTER_NO_LOAD_SPEED_RAD_PER_S) return 0.0
+        val stallTorqueNm = STARTER_STALL_ANGULAR_ACCEL_RAD_PER_S2 * totalMomentOfInertiaKgM2()
+        return stallTorqueNm * (1.0 - omega / STARTER_NO_LOAD_SPEED_RAD_PER_S)
+    }
 
     private fun coulombFrictionCoefficient(omega: Double): Double {
         val lubeQuality = (lubricationPercent / 100.0).coerceIn(0.05, 1.0)
@@ -463,6 +509,7 @@ class SteamEnginePlant(
         circuitBreakerSwitch.update(dt)
         drainCocksSwitch.update(dt)
         blowdownValveSwitch.update(dt)
+        starterMotorSwitch.update(dt)
     }
 
     private fun integrateSubstep(dt: Double) {
@@ -650,10 +697,16 @@ class SteamEnginePlant(
 
         val currentFlows = clutchSwitch.effective && circuitBreakerSwitch.effective
 
+        // The starting motor's crank torque at a dead stop counts toward breaking the
+        // engine away from rest, exactly like the steam and gravity torques do - it's
+        // there precisely to overcome the stiction a stalled engine can't overcome on
+        // its own from a dead centre.
+        val starterBreakawayTorqueNm = starterMotorTorqueNm(0.0)
+
         var omega = angularVelocityRadPerS
         omega = when {
             overloaded -> 0.0
-            omega <= 1e-6 && drivingTorqueNm + gravityTorqueNm <= staticFrictionTorqueNm -> 0.0
+            omega <= 1e-6 && drivingTorqueNm + gravityTorqueNm + starterBreakawayTorqueNm <= staticFrictionTorqueNm -> 0.0
             else -> {
                 val muCoulomb = coulombFrictionCoefficient(omega)
                 val kineticFrictionTorqueNm = muCoulomb * normalForceN * frame.bearingRadiusM
@@ -682,7 +735,9 @@ class SteamEnginePlant(
                     0.0
                 }
 
-                val netTorqueNm = drivingTorqueNm + gravityTorqueNm - kineticFrictionTorqueNm - viscousFrictionTorqueNm -
+                val starterTorqueNm = starterMotorTorqueNm(omega)
+
+                val netTorqueNm = drivingTorqueNm + gravityTorqueNm + starterTorqueNm - kineticFrictionTorqueNm - viscousFrictionTorqueNm -
                     windageTorqueNm - coreLossTorqueNm - generatorLoadTorqueNm - brakeTorqueNm
                 val angularAccelerationRadPerS2 = netTorqueNm / totalMomentOfInertiaKgM2()
                 max(0.0, omega + angularAccelerationRadPerS2 * dt)
@@ -897,6 +952,7 @@ class SteamEnginePlant(
             circuitBreakerClosed = circuitBreakerSwitch.effective,
             drainCocksOpen = drainCocksSwitch.effective,
             blowdownValveOpen = blowdownValveSwitch.effective,
+            starterMotorEngaged = starterMotorSwitch.effective,
             flameActive = effectiveHeatInputW > 0.0,
             flywheelStressFraction = flywheelLattice.stressFraction,
             boilerStressFraction = saturationPressurePa(reportedBoilerTemperatureK) / (boiler.maxPressurePa * boilerRuptureMargin),

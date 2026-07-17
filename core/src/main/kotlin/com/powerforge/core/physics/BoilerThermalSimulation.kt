@@ -65,6 +65,22 @@ class BoilerThermalSimulation(private val maxParticles: Int = 220, private val t
          * same as [targetWaterParticleCount].
          */
         private const val TARGET_FLAME_INJECTIONS_PER_SECOND = 80.0
+
+        /**
+         * Effective internal degrees of freedom of liquid water, on top of the 2
+         * translational DOF this 2D sim tracks explicitly. Real liquid water's specific
+         * heat is ~4186 J/kg/K, but only its translational motion (2 DOF) would give
+         * k/m ~ 461 J/kg/K - about a ninth of that - because most of water's heat
+         * capacity lives in its rotational/librational motion and, above all, in making
+         * and breaking hydrogen bonds, none of which a bare translational model stores.
+         * Without these extra modes the boiler heats ~9x too fast for a given flame.
+         * f is fixed entirely by the real measured specific heat: c = (1 + f_internal/2)
+         * * k/m, solved for f_internal - a real material property, not a tuning knob.
+         */
+        val WATER_INTERNAL_DOF = 2.0 * (
+            PhysicsConstants.WATER_SPECIFIC_HEAT_J_PER_KG_K *
+                KineticCylinderGas.WATER_MOLECULE_MASS_KG / BOLTZMANN_J_PER_K - 1.0
+            )
     }
 
     private val vx = DoubleArray(maxParticles)
@@ -89,6 +105,18 @@ class BoilerThermalSimulation(private val maxParticles: Int = 220, private val t
     private var relativeSpeedMaxEstimateMPerS = ambientRelativeSpeedEstimate()
     private var pendingCollisionCandidates = 0.0
 
+    /**
+     * The real thermal energy currently held in the water's internal molecular modes
+     * (rotational/librational + hydrogen bonding) - see [WATER_INTERNAL_DOF]. Kept as a
+     * running reservoir and re-equilibrated with the water particles' translational
+     * kinetic energy every step, so the boiler carries liquid water's real heat capacity
+     * (warming at the right rate) instead of its translational-only ninth. Scaled with
+     * the water mass between steps so it tracks the real molecule count as feedwater and
+     * evaporation change how much water is actually in the boiler.
+     */
+    private var waterInternalEnergyJ = 0.0
+    private var lastWaterMassKg = 0.0
+
     var temperatureK: Double = PhysicsConstants.AMBIENT_TEMPERATURE_K
         private set
 
@@ -108,6 +136,27 @@ class BoilerThermalSimulation(private val maxParticles: Int = 220, private val t
             vx[i] = gaussianSample() * thermalSpeed
             vy[i] = gaussianSample() * thermalSpeed
         }
+        // A finite random draw of a few hundred velocities never lands exactly on the
+        // target temperature - the sample variance of that many Gaussians scatters a few
+        // percent around 1, so the ensemble's actual mean kinetic energy (the real
+        // temperature it will read back) can sit noticeably off the temperature it was
+        // meant to be seeded at. A real, fully-thermalized body of water at temperature T
+        // has exactly <KE> = kT; rescale the sampled velocities to that exact energy so a
+        // boiler seeded cold genuinely starts cold, instead of reporting whatever
+        // temperature this particular draw happened to land on. This matters far more now
+        // that the water carries its real (high) heat capacity: it would otherwise sit at
+        // that seed artifact for a long time instead of racing past it.
+        var sumSpeedSquared = 0.0
+        for (i in 0 until activeCount) sumSpeedSquared += vx[i] * vx[i] + vy[i] * vy[i]
+        if (sumSpeedSquared > 1e-30) {
+            // 2D equipartition: target mean (vx^2 + vy^2) per particle = 2kT/m.
+            val targetMeanSpeedSquared = 2.0 * BOLTZMANN_J_PER_K * atTemperatureK / KineticCylinderGas.WATER_MOLECULE_MASS_KG
+            val scale = sqrt(targetMeanSpeedSquared * activeCount / sumSpeedSquared)
+            for (i in 0 until activeCount) {
+                vx[i] *= scale
+                vy[i] *= scale
+            }
+        }
         temperatureK = atTemperatureK
     }
 
@@ -124,6 +173,8 @@ class BoilerThermalSimulation(private val maxParticles: Int = 220, private val t
         pendingCollisionCandidates = 0.0
         relativeSpeedMaxEstimateMPerS = ambientRelativeSpeedEstimate()
         rng = Random(0x50117_b01)
+        waterInternalEnergyJ = 0.0
+        lastWaterMassKg = 0.0
         seedWaterParticles(PhysicsConstants.AMBIENT_TEMPERATURE_K)
     }
 
@@ -306,6 +357,59 @@ class BoilerThermalSimulation(private val maxParticles: Int = 220, private val t
                     }
                 }
             }
+        }
+
+        // Real internal molecular energy (rotational/librational + hydrogen bonding) in
+        // fast equilibrium with the water's translational motion - see
+        // [waterInternalEnergyJ]/[WATER_INTERNAL_DOF]. The collisions and wall exchange
+        // above changed only translational velocities; this settles the internal
+        // reservoir back to equipartition with them, moving energy between the two so the
+        // water carries liquid water's real heat capacity (~4186 J/kg/K) instead of its
+        // translational-only ninth (~461). Total energy (translational + internal) is
+        // conserved by the move; only the split shifts.
+        if (activeCount > 0) {
+            var translationalEnergyJ = 0.0
+            for (p in 0 until activeCount) {
+                if (!isFlame[p]) translationalEnergyJ += 0.5 * waterPointMassKg * (vx[p] * vx[p] + vy[p] * vy[p])
+            }
+            if (lastWaterMassKg > 1e-9) {
+                // Track the real molecule count as feedwater/evaporation change how much
+                // water is in the boiler, so adding water at the same temperature scales
+                // the reservoir up in step with the translational energy rather than
+                // diluting the internal share.
+                waterInternalEnergyJ *= waterMassKg / lastWaterMassKg
+            } else {
+                // First step after a (re)seed: put the reservoir straight at equilibrium
+                // with the seeded translational energy so the re-partition below doesn't
+                // rob the freshly-seeded water of its share on step one.
+                waterInternalEnergyJ = translationalEnergyJ * (WATER_INTERNAL_DOF / 2.0)
+            }
+            lastWaterMassKg = waterMassKg
+
+            val totalThermalEnergyJ = translationalEnergyJ + waterInternalEnergyJ
+            // Equipartition: translation holds 2 of the (2 + internal) total DOF.
+            val translationalTargetJ = totalThermalEnergyJ * 2.0 / (2.0 + WATER_INTERNAL_DOF)
+            if (translationalEnergyJ > 1e-30) {
+                val velocityScale = sqrt(translationalTargetJ / translationalEnergyJ)
+                for (p in 0 until activeCount) {
+                    if (!isFlame[p]) {
+                        vx[p] *= velocityScale
+                        vy[p] *= velocityScale
+                    }
+                }
+            } else if (translationalTargetJ > 1e-30) {
+                val realMoleculesPerWaterParticle = waterPointMassKg / KineticCylinderGas.WATER_MOLECULE_MASS_KG
+                val realMoleculeCount = targetWaterParticleCount.toDouble() * realMoleculesPerWaterParticle
+                val impliedTemperatureK = translationalTargetJ / (realMoleculeCount * BOLTZMANN_J_PER_K)
+                val thermalSpeed = sqrt(BOLTZMANN_J_PER_K * impliedTemperatureK / KineticCylinderGas.WATER_MOLECULE_MASS_KG)
+                for (p in 0 until activeCount) {
+                    if (!isFlame[p]) {
+                        vx[p] = gaussianSample() * thermalSpeed
+                        vy[p] = gaussianSample() * thermalSpeed
+                    }
+                }
+            }
+            waterInternalEnergyJ = totalThermalEnergyJ - translationalTargetJ
         }
 
         // Temperature from the water particles' real mean kinetic energy per real
