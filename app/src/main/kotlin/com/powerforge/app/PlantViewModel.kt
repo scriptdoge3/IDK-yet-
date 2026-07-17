@@ -38,7 +38,11 @@ class PlantViewModel : ViewModel() {
     // A fresh session starts as a real plant actually does: cold, unlit, and
     // stopped - the operator has to light the burner and bring it up to pressure
     // themselves, not find it already running.
-    private val plant = SteamEnginePlant().apply { ignitionOn = false }
+    // 500x the boiler's default particle resolution for far smoother temperature/pressure
+    // readings (sampling noise falls as 1/sqrt of the count, so ~22x smoother). Only
+    // affordable because the boiler's thermal step then runs on a coarse cadence instead
+    // of every crank substep - see SteamEnginePlant.boilerThermalStepIntervalSeconds.
+    private val plant = SteamEnginePlant(boilerWaterParticleCount = 80_000).apply { ignitionOn = false }
 
     private var credits: Double = 0.0
     private var researchPoints: Double = 0.0

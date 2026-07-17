@@ -38,6 +38,16 @@ class SteamEnginePlant(
     var flywheel: Flywheel = Flywheel(1),
     var rotor: GeneratorRotor = GeneratorRotor(1),
     var frame: Frame = Frame(1),
+    /**
+     * How many representative water particles the boiler's thermal sim tracks. This is a
+     * pure numerical-resolution knob (see [BoilerThermalSimulation]) - it does not change
+     * the physics, only how much sampling noise the boiler readings carry (noise falls as
+     * 1/sqrt of this). The default keeps the boiler cheap enough to resolve at full
+     * crank-substep resolution; the game runs a far higher count for smoother gauges,
+     * which is only affordable because the boiler's thermal step then advances on its own
+     * coarse cadence (see [boilerThermalStepIntervalSeconds]) rather than every substep.
+     */
+    boilerWaterParticleCount: Int = 160,
 ) {
     // --- State ---
 
@@ -130,7 +140,29 @@ class SteamEnginePlant(
      * see [BoilerThermalSimulation]. Boiler temperature falls out of the water
      * particles' actual kinetic energy, not a bulk energy-balance formula.
      */
-    private val boilerThermal = BoilerThermalSimulation()
+    private val boilerThermal = BoilerThermalSimulation(
+        maxParticles = maxOf(220, (boilerWaterParticleCount * 1.375).toInt()),
+        targetWaterParticleCount = boilerWaterParticleCount,
+    )
+
+    /**
+     * How often (in simulated seconds) the boiler's thermal particle sim actually
+     * advances. The boiler's thermal timescale is seconds, so resolving it at every
+     * millisecond-scale crank substep is enormous over-sampling; at the default low
+     * particle count it's cheap enough not to matter and this is 0 (step every substep,
+     * exactly as before - which is what the tests exercise). At the high particle counts
+     * the game uses, the collision pass is far too expensive to run per substep, so it's
+     * advanced on this coarse cadence instead, with the flame heat and steam draw in
+     * between accumulated and applied in one larger step. The boiler's temperature (and
+     * so its pressure) is held constant between these steps, which is a fine approximation
+     * given how little it moves over a fraction of a second - and it's the change that
+     * makes a ~500x particle count affordable at all.
+     */
+    private val boilerThermalStepIntervalSeconds: Double =
+        if (boilerWaterParticleCount > 500) 0.3 else 0.0
+    private var boilerThermalAccumulatorSeconds = 0.0
+    private var accumulatedFlameEnergyJ = 0.0
+    private var accumulatedNonFlameLossJ = 0.0
 
     private var secondsAtZeroLubricationWhileRunning: Double = 0.0
     private var secondsDryFiring: Double = 0.0
@@ -245,6 +277,9 @@ class SteamEnginePlant(
         reportedCylinderTemperatureK = PhysicsConstants.AMBIENT_TEMPERATURE_K
         boilerTemperatureAccumulatorK = 0.0
         boilerTemperatureWeightSeconds = 0.0
+        boilerThermalAccumulatorSeconds = 0.0
+        accumulatedFlameEnergyJ = 0.0
+        accumulatedNonFlameLossJ = 0.0
         cylinderPressureAccumulatorPa = 0.0
         cylinderTemperatureAccumulatorK = 0.0
         cylinderWeightSeconds = 0.0
@@ -838,14 +873,7 @@ class SteamEnginePlant(
         // temperature formula.
         val nonFlameHeatLossW = heatExtractedByPistonW + heatLossToEnvironmentW +
             automaticVentLossW + manualVentLossW + blowdownLossW + coldFeedwaterHeatSinkW
-        boilerTemperatureK = boilerThermal.step(
-            flamePowerW = effectiveHeatInputW,
-            waterMassKg = max(0.005, boilerWaterMassKg),
-            insulationLossW = nonFlameHeatLossW,
-            dt = dt,
-        )
-        boilerTemperatureAccumulatorK += boilerTemperatureK * dt
-        boilerTemperatureWeightSeconds += dt
+        advanceBoilerThermal(effectiveHeatInputW, nonFlameHeatLossW, dt)
 
         boilerWaterMassKg = (boilerWaterMassKg + (feedwaterMassFlowKgPerS - waterOutflowKgPerS) * dt)
             .coerceIn(0.0, boiler.waterCapacityKg)
@@ -886,16 +914,49 @@ class SteamEnginePlant(
         angularVelocityRadPerS = 0.0
     }
 
-    private fun coolDown(dt: Double) {
-        val heatLossToEnvironmentW = boiler.insulationLossWPerK * (boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
-        boilerTemperatureK = boilerThermal.step(
-            flamePowerW = 0.0,
-            waterMassKg = max(0.005, boilerWaterMassKg),
-            insulationLossW = heatLossToEnvironmentW,
-            dt = dt,
-        )
+    /**
+     * Advances the boiler's thermal particle sim. At the default resolution
+     * ([boilerThermalStepIntervalSeconds] == 0) this steps it every substep with the
+     * exact same arguments as before - byte-for-byte the old behaviour, which is what the
+     * tests exercise. At the high particle counts the game uses, it instead accumulates
+     * the flame heat and the non-flame loss and steps the (expensive) particle sim only
+     * once every [boilerThermalStepIntervalSeconds], applying the accumulated energy in
+     * one larger step; energy is conserved exactly (the accumulated joules are just
+     * expressed back as an average power over the larger dt), and the boiler temperature
+     * is held constant in between, which is fine over a fraction of a second.
+     */
+    private fun advanceBoilerThermal(flamePowerW: Double, nonFlameLossW: Double, dt: Double) {
+        if (boilerThermalStepIntervalSeconds <= 0.0) {
+            boilerTemperatureK = boilerThermal.step(
+                flamePowerW = flamePowerW,
+                waterMassKg = max(0.005, boilerWaterMassKg),
+                insulationLossW = nonFlameLossW,
+                dt = dt,
+            )
+        } else {
+            boilerThermalAccumulatorSeconds += dt
+            accumulatedFlameEnergyJ += flamePowerW * dt
+            accumulatedNonFlameLossJ += nonFlameLossW * dt
+            if (boilerThermalAccumulatorSeconds >= boilerThermalStepIntervalSeconds) {
+                val dtB = boilerThermalAccumulatorSeconds
+                boilerTemperatureK = boilerThermal.step(
+                    flamePowerW = accumulatedFlameEnergyJ / dtB,
+                    waterMassKg = max(0.005, boilerWaterMassKg),
+                    insulationLossW = accumulatedNonFlameLossJ / dtB,
+                    dt = dtB,
+                )
+                boilerThermalAccumulatorSeconds = 0.0
+                accumulatedFlameEnergyJ = 0.0
+                accumulatedNonFlameLossJ = 0.0
+            }
+        }
         boilerTemperatureAccumulatorK += boilerTemperatureK * dt
         boilerTemperatureWeightSeconds += dt
+    }
+
+    private fun coolDown(dt: Double) {
+        val heatLossToEnvironmentW = boiler.insulationLossWPerK * (boilerTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
+        advanceBoilerThermal(0.0, heatLossToEnvironmentW, dt)
         val windingCoolingW = 0.8 * (rotorWindingTemperatureK - PhysicsConstants.AMBIENT_TEMPERATURE_K)
         rotorWindingTemperatureK = max(
             PhysicsConstants.AMBIENT_TEMPERATURE_K,
